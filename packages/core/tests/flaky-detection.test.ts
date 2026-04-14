@@ -29,7 +29,8 @@ describe('FlakyDetector', () => {
         'test.ts > existing > test B',
         'test.ts > test.ts > new > test D',
       ];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
+      detector.setTestNames(allTests);
       expect(detector.isCandidate('test.ts > test.ts > new > test D')).toBe(true);
       expect(detector.isCandidate('test.ts > existing > test A')).toBe(false);
     });
@@ -40,7 +41,8 @@ describe('FlakyDetector', () => {
         'test.ts > existing > test B',
         'test.ts > test.ts > new > test D',
       ];
-      const detector = new FlakyDetector(baseContext, 'unhealthy', allTests);
+      const detector = new FlakyDetector(baseContext, 'unhealthy');
+      detector.setTestNames(allTests);
       expect(detector.isCandidate('test.ts > existing > test B')).toBe(true);
       expect(detector.isCandidate('test.ts > existing > test A')).toBe(false);
       expect(detector.isCandidate('test.ts > test.ts > new > test D')).toBe(false);
@@ -49,8 +51,24 @@ describe('FlakyDetector', () => {
     it('excludes tests with names exceeding max length', () => {
       const longName = 'a'.repeat(256);
       const allTests = [longName];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
+      detector.setTestNames(allTests);
       expect(detector.isCandidate(longName)).toBe(false);
+    });
+
+    it('falls back to context lists without setTestNames', () => {
+      const detector = new FlakyDetector(baseContext, 'unhealthy');
+      // unhealthy_test_names includes 'test.ts > existing > test B'
+      expect(detector.isCandidate('test.ts > existing > test B')).toBe(true);
+      expect(detector.isCandidate('test.ts > existing > test A')).toBe(false);
+    });
+
+    it('falls back to context lists for new mode without setTestNames', () => {
+      const detector = new FlakyDetector(baseContext, 'new');
+      // existing_test_names includes test A, so it's NOT a candidate
+      expect(detector.isCandidate('test.ts > existing > test A')).toBe(false);
+      // unknown test is a candidate
+      expect(detector.isCandidate('test.ts > brand new > test')).toBe(true);
     });
   });
 
@@ -64,7 +82,8 @@ describe('FlakyDetector', () => {
         'test.ts > existing > test C',
         'test.ts > new > test',
       ];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
+      detector.setTestNames(allTests);
       // Budget should be min(0.2 * 300, 1000) = max(60, 1000) = 1000
       const summary = detector.getSummary();
       expect(summary.budgetMs).toBe(1000);
@@ -83,7 +102,8 @@ describe('FlakyDetector', () => {
         'test.ts > existing > test C',
         'test.ts > new > test',
       ];
-      const detector = new FlakyDetector(ctx, 'new', allTests);
+      const detector = new FlakyDetector(ctx, 'new');
+      detector.setTestNames(allTests);
       const summary = detector.getSummary();
       expect(summary.budgetMs).toBe(6000);
     });
@@ -93,7 +113,8 @@ describe('FlakyDetector', () => {
     it('calculates repeats based on budget and duration', () => {
       const ctx = { ...baseContext, min_budget_duration_ms: 1000, max_test_execution_count: 10 };
       const allTests = ['test.ts > existing > test A', 'test.ts > new > test'];
-      const detector = new FlakyDetector(ctx, 'new', allTests);
+      const detector = new FlakyDetector(ctx, 'new');
+      detector.setTestNames(allTests);
       // Budget = 1000ms, 1 candidate → perTestDeadline = 1000ms
       // initialDuration = 100ms → floor(1000/100) - 1 = 9 reruns, capped at 10-1=9
       expect(detector.getMaxRepeats('test.ts > new > test', 100)).toBe(9);
@@ -102,33 +123,40 @@ describe('FlakyDetector', () => {
     it('returns 0 for too-slow tests', () => {
       const ctx = { ...baseContext, min_budget_duration_ms: 100, min_test_execution_count: 3 };
       const allTests = ['test.ts > existing > test A', 'test.ts > new > test'];
-      const detector = new FlakyDetector(ctx, 'new', allTests);
+      const detector = new FlakyDetector(ctx, 'new');
+      detector.setTestNames(allTests);
       // Budget = 100ms, 1 candidate → perTestDeadline = 100ms
       // initialDuration = 50ms, 50 × 3 = 150 > 100 → too slow
       expect(detector.getMaxRepeats('test.ts > new > test', 50)).toBe(0);
+    });
+
+    it('uses min_budget_duration_ms as deadline without setTestNames', () => {
+      const ctx = { ...baseContext, min_budget_duration_ms: 1000, max_test_execution_count: 10 };
+      const detector = new FlakyDetector(ctx, 'unhealthy');
+      // No setTestNames — deadline falls back to max(budgetMs, min_budget_duration_ms)
+      // budgetMs = 0.1 * 100 = 10, min = 1000 → deadline = 1000ms
+      // 100ms duration → floor(1000/100) - 1 = 9, capped at 9
+      expect(detector.getMaxRepeats('test.ts > existing > test B', 100)).toBe(9);
     });
   });
 
   describe('flaky detection', () => {
     it('detects flaky when test has both pass and fail outcomes', () => {
-      const allTests = ['test.ts > new > test'];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
       detector.recordOutcome('test.ts > new > test', 'pass');
       detector.recordOutcome('test.ts > new > test', 'fail');
       expect(detector.isFlaky('test.ts > new > test')).toBe(true);
     });
 
     it('does not detect flaky when test only passes', () => {
-      const allTests = ['test.ts > new > test'];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
       detector.recordOutcome('test.ts > new > test', 'pass');
       detector.recordOutcome('test.ts > new > test', 'pass');
       expect(detector.isFlaky('test.ts > new > test')).toBe(false);
     });
 
     it('tracks rerun count', () => {
-      const allTests = ['test.ts > new > test'];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
       detector.recordOutcome('test.ts > new > test', 'pass');
       detector.recordOutcome('test.ts > new > test', 'fail');
       detector.recordOutcome('test.ts > new > test', 'pass');
@@ -139,7 +167,8 @@ describe('FlakyDetector', () => {
   describe('summary', () => {
     it('returns summary with rerun data', () => {
       const allTests = ['test.ts > existing > test A', 'test.ts > new > test'];
-      const detector = new FlakyDetector(baseContext, 'new', allTests);
+      const detector = new FlakyDetector(baseContext, 'new');
+      detector.setTestNames(allTests);
       detector.recordOutcome('test.ts > new > test', 'pass');
       detector.recordOutcome('test.ts > new > test', 'fail');
 

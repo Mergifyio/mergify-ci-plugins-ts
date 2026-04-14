@@ -64,49 +64,75 @@ type TestMetrics = {
 export class FlakyDetector {
   private context: FlakyDetectionContext;
   private mode: FlakyDetectionMode;
-  private candidates: Set<string>;
-  private existingTestsInSession: Set<string>;
+  private candidates: Set<string> = new Set();
   private budgetMs: number;
-  private perTestDeadlineMs: number;
+  private perTestDeadlineMs: number = 0;
   private testMetrics: Map<string, TestMetrics> = new Map();
   private tooSlowTests: string[] = [];
 
-  constructor(context: FlakyDetectionContext, mode: FlakyDetectionMode, allTestNames: string[]) {
+  constructor(context: FlakyDetectionContext, mode: FlakyDetectionMode) {
     this.context = context;
     this.mode = mode;
 
-    const existingSet = new Set(context.existing_test_names);
-    const unhealthySet = new Set(context.unhealthy_test_names);
-
-    // Count existing tests in this session for budget calculation
-    this.existingTestsInSession = new Set(allTestNames.filter((t) => existingSet.has(t)));
-
-    // Identify candidates based on mode
-    if (mode === 'new') {
-      this.candidates = new Set(
-        allTestNames.filter((t) => !existingSet.has(t) && t.length <= context.max_test_name_length)
-      );
-    } else {
-      this.candidates = new Set(
-        allTestNames.filter((t) => unhealthySet.has(t) && t.length <= context.max_test_name_length)
-      );
-    }
-
-    // Calculate budget
     const budgetRatio =
       mode === 'new'
         ? context.budget_ratio_for_new_tests
         : context.budget_ratio_for_unhealthy_tests;
-    const totalDurationMs =
-      context.existing_tests_mean_duration_ms * this.existingTestsInSession.size;
-    this.budgetMs = Math.max(budgetRatio * totalDurationMs, context.min_budget_duration_ms);
+    this.budgetMs = budgetRatio * context.existing_tests_mean_duration_ms;
+  }
 
-    // Static per-test deadline (xdist-style)
-    this.perTestDeadlineMs = this.candidates.size > 0 ? this.budgetMs / this.candidates.size : 0;
+  /**
+   * Register session test names to compute candidates and per-test budgets.
+   * When test names are known upfront (e.g. vitest), call this before running
+   * tests. When they aren't (e.g. Playwright global setup), skip this call —
+   * isCandidate() will fall back to checking against the context lists directly.
+   */
+  setTestNames(allTestNames: string[]): void {
+    const existingSet = new Set(this.context.existing_test_names);
+    const unhealthySet = new Set(this.context.unhealthy_test_names);
+
+    const existingTestsInSession = allTestNames.filter((t) => existingSet.has(t)).length;
+
+    if (this.mode === 'new') {
+      this.candidates = new Set(
+        allTestNames.filter(
+          (t) => !existingSet.has(t) && t.length <= this.context.max_test_name_length
+        )
+      );
+    } else {
+      this.candidates = new Set(
+        allTestNames.filter(
+          (t) => unhealthySet.has(t) && t.length <= this.context.max_test_name_length
+        )
+      );
+    }
+
+    const totalDurationMs =
+      this.context.existing_tests_mean_duration_ms * existingTestsInSession;
+    this.budgetMs = Math.max(
+      this.budgetMs,
+      totalDurationMs *
+        (this.mode === 'new'
+          ? this.context.budget_ratio_for_new_tests
+          : this.context.budget_ratio_for_unhealthy_tests)
+    );
+    this.budgetMs = Math.max(this.budgetMs, this.context.min_budget_duration_ms);
+
+    this.perTestDeadlineMs =
+      this.candidates.size > 0 ? this.budgetMs / this.candidates.size : 0;
   }
 
   isCandidate(testName: string): boolean {
-    return this.candidates.has(testName);
+    // If setTestNames was called, use the pre-computed candidate set
+    if (this.candidates.size > 0) {
+      return this.candidates.has(testName);
+    }
+    // Fallback: check against the context lists directly
+    if (testName.length > this.context.max_test_name_length) return false;
+    if (this.mode === 'new') {
+      return !this.context.existing_test_names.includes(testName);
+    }
+    return this.context.unhealthy_test_names.includes(testName);
   }
 
   /** Calculate max repeats for a candidate test. Call after first execution to use actual duration. */
@@ -114,16 +140,23 @@ export class FlakyDetector {
     const metrics = this.getOrCreateMetrics(testName);
     metrics.initialDurationMs = initialDurationMs;
 
+    // Use per-test deadline when available (setTestNames was called),
+    // otherwise fall back to the full budget as the deadline for this test
+    const deadline =
+      this.perTestDeadlineMs > 0
+        ? this.perTestDeadlineMs
+        : Math.max(this.budgetMs, this.context.min_budget_duration_ms);
+
     // Check if test is too slow for even min_test_execution_count
-    if (initialDurationMs * this.context.min_test_execution_count > this.perTestDeadlineMs) {
+    if (initialDurationMs * this.context.min_test_execution_count > deadline) {
       metrics.tooSlow = true;
       this.tooSlowTests.push(testName);
       return 0;
     }
 
-    // How many reruns fit in the per-test deadline?
+    // How many reruns fit in the deadline?
     const maxByBudget =
-      initialDurationMs > 0 ? Math.floor(this.perTestDeadlineMs / initialDurationMs) - 1 : 0;
+      initialDurationMs > 0 ? Math.floor(deadline / initialDurationMs) - 1 : 0;
     // Cap by max_test_execution_count (subtract 1 for the initial run)
     return Math.max(0, Math.min(maxByBudget, this.context.max_test_execution_count - 1));
   }

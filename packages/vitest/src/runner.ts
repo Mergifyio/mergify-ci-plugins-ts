@@ -38,7 +38,8 @@ export default class MergifyRunner extends VitestTestRunner {
 
     // Collect all test names from the file
     const allTestNames = this.collectTestNames(test.file!);
-    this.flakyDetector = new FlakyDetector(this._flakyContext, this.flakyMode, allTestNames);
+    this.flakyDetector = new FlakyDetector(this._flakyContext, this.flakyMode);
+    this.flakyDetector.setTestNames(allTestNames);
   }
 
   private collectTestNames(suite: Suite): string[] {
