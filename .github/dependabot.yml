@@ -11,6 +11,10 @@ updates:
       opentelemetry:
         patterns:
           - "@opentelemetry/*"
+      vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
   - package-ecosystem: github-actions
     directory: /
     schedule:
