@@ -1,7 +1,7 @@
 import { relative } from 'node:path';
 import { test as baseTest, expect, type TestInfo } from '@playwright/test';
 import { readStateFile } from './state-file.js';
-import { buildQuarantineKey, toPosix } from './utils.js';
+import { buildTestKey, toPosix } from './utils.js';
 
 interface ApplyArgs {
   testInfo: TestInfo;
@@ -17,7 +17,7 @@ export function applyQuarantine({ testInfo, quarantineSet, rootDir }: ApplyArgs)
   if (status === undefined || !FAILED_STATUSES.has(status)) return;
 
   const filepath = toPosix(relative(rootDir, testInfo.file));
-  const key = buildQuarantineKey(filepath, testInfo.titlePath, testInfo.title);
+  const key = buildTestKey(filepath, testInfo.titlePath, testInfo.title);
   if (!quarantineSet.has(key)) return;
 
   // Mirror the actual status. Playwright reconciles a test as "expected" only
@@ -46,7 +46,17 @@ function loadWorkerState(): { quarantineSet: Set<string>; rootDir: string } | nu
     }
     return null;
   }
-  workerState = { quarantineSet: new Set(state.quarantinedTests), rootDir: state.rootDir };
+  // In unhealthy mode, treat the API-provided unhealthy_test_names list as
+  // additional quarantine entries — failures get absorbed in phase 1 the
+  // same way regular quarantine works. Phase-2 reruns (orchestrated by the
+  // reporter) then measure flakiness on top.
+  const set = new Set<string>(state.quarantinedTests);
+  if (state.flakyMode === 'unhealthy' && state.flakyContext) {
+    for (const name of state.flakyContext.unhealthy_test_names) {
+      set.add(name);
+    }
+  }
+  workerState = { quarantineSet: set, rootDir: state.rootDir };
   return workerState;
 }
 

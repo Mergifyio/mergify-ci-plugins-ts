@@ -63,11 +63,11 @@ type TestMetrics = {
 
 export class FlakyDetector {
   private context: FlakyDetectionContext;
-  private mode: FlakyDetectionMode;
-  private candidates: Set<string>;
+  public readonly mode: FlakyDetectionMode;
+  public readonly candidates: Set<string>;
   private existingTestsInSession: Set<string>;
   private budgetMs: number;
-  private perTestDeadlineMs: number;
+  public readonly perTestDeadlineMs: number;
   private testMetrics: Map<string, TestMetrics> = new Map();
   private tooSlowTests: string[] = [];
 
@@ -75,34 +75,52 @@ export class FlakyDetector {
     this.context = context;
     this.mode = mode;
 
+    const { candidates, existingTestsInSession, budgetMs, perTestDeadlineMs } =
+      FlakyDetector.computeFromTestList(context, mode, allTestNames);
+
+    this.candidates = candidates;
+    this.existingTestsInSession = existingTestsInSession;
+    this.budgetMs = budgetMs;
+    this.perTestDeadlineMs = perTestDeadlineMs;
+  }
+
+  private static computeFromTestList(
+    context: FlakyDetectionContext,
+    mode: FlakyDetectionMode,
+    allTestNames: string[]
+  ): {
+    candidates: Set<string>;
+    existingTestsInSession: Set<string>;
+    budgetMs: number;
+    perTestDeadlineMs: number;
+  } {
     const existingSet = new Set(context.existing_test_names);
     const unhealthySet = new Set(context.unhealthy_test_names);
 
-    // Count existing tests in this session for budget calculation
-    this.existingTestsInSession = new Set(allTestNames.filter((t) => existingSet.has(t)));
+    const existingTestsInSession = new Set(allTestNames.filter((t) => existingSet.has(t)));
 
-    // Identify candidates based on mode
-    if (mode === 'new') {
-      this.candidates = new Set(
-        allTestNames.filter((t) => !existingSet.has(t) && t.length <= context.max_test_name_length)
-      );
-    } else {
-      this.candidates = new Set(
-        allTestNames.filter((t) => unhealthySet.has(t) && t.length <= context.max_test_name_length)
-      );
-    }
+    const candidates =
+      mode === 'new'
+        ? new Set(
+            allTestNames.filter(
+              (t) => !existingSet.has(t) && t.length <= context.max_test_name_length
+            )
+          )
+        : new Set(
+            allTestNames.filter(
+              (t) => unhealthySet.has(t) && t.length <= context.max_test_name_length
+            )
+          );
 
-    // Calculate budget
     const budgetRatio =
       mode === 'new'
         ? context.budget_ratio_for_new_tests
         : context.budget_ratio_for_unhealthy_tests;
-    const totalDurationMs =
-      context.existing_tests_mean_duration_ms * this.existingTestsInSession.size;
-    this.budgetMs = Math.max(budgetRatio * totalDurationMs, context.min_budget_duration_ms);
+    const totalDurationMs = context.existing_tests_mean_duration_ms * existingTestsInSession.size;
+    const budgetMs = Math.max(budgetRatio * totalDurationMs, context.min_budget_duration_ms);
+    const perTestDeadlineMs = candidates.size > 0 ? budgetMs / candidates.size : 0;
 
-    // Static per-test deadline (xdist-style)
-    this.perTestDeadlineMs = this.candidates.size > 0 ? this.budgetMs / this.candidates.size : 0;
+    return { candidates, existingTestsInSession, budgetMs, perTestDeadlineMs };
   }
 
   isCandidate(testName: string): boolean {
