@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
@@ -548,5 +548,230 @@ describe('MergifyReporter V2 — quarantine', () => {
     await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
     const output = log.mock.calls.map((c) => String(c[0])).join('');
     expect(output).not.toContain('Quarantine report');
+  });
+});
+
+describe('MergifyReporter — flaky-detection onBegin enrichment', () => {
+  let cacheRoot: string;
+  let statePath: string;
+
+  beforeEach(() => {
+    vi.stubEnv('GITHUB_ACTIONS', 'true');
+    vi.stubEnv('GITHUB_REPOSITORY', 'test-owner/test-repo');
+    cacheRoot = mkdtempSync(join(tmpdir(), 'mergify-flaky-onbegin-'));
+    statePath = stateFilePath(cacheRoot, 'run-1');
+    process.env.MERGIFY_TEST_RUN_ID = 'run-1';
+    process.env.MERGIFY_STATE_FILE = statePath;
+  });
+
+  afterEach(() => {
+    rmSync(cacheRoot, { recursive: true, force: true });
+    vi.unstubAllEnvs();
+    delete process.env.MERGIFY_TEST_RUN_ID;
+    delete process.env.MERGIFY_STATE_FILE;
+  });
+
+  function seedState(overrides: Record<string, unknown>): void {
+    mkdirSync(dirname(statePath), { recursive: true });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        testRunId: 'run-1',
+        createdAt: '2026-04-29T00:00:00Z',
+        rootDir: '/root',
+        quarantinedTests: [],
+        ...overrides,
+      })
+    );
+  }
+
+  function readState() {
+    return JSON.parse(readFileSync(statePath, 'utf8'));
+  }
+
+  function suiteWithTests(tests: TestCase[]): Suite {
+    return { allTests: () => tests } as unknown as Suite;
+  }
+
+  it('walks the suite, computes candidates + deadline, and writes them back', () => {
+    seedState({
+      flakyContext: {
+        budget_ratio_for_new_tests: 0.5,
+        budget_ratio_for_unhealthy_tests: 0.5,
+        existing_test_names: ['tests/sample.spec.ts > existing-test'],
+        existing_tests_mean_duration_ms: 100,
+        unhealthy_test_names: [],
+        max_test_execution_count: 5,
+        max_test_name_length: 200,
+        min_budget_duration_ms: 1_000,
+        min_test_execution_count: 3,
+      },
+      flakyMode: 'new',
+    });
+
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    const tests = [
+      fakeTest({
+        title: 'existing-test',
+        titlePath: ['proj', '/root/tests/sample.spec.ts', 'existing-test'],
+        location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+      }),
+      fakeTest({
+        title: 'new-test-1',
+        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-1'],
+        location: { file: '/root/tests/sample.spec.ts', line: 5, column: 1 },
+      }),
+      fakeTest({
+        title: 'new-test-2',
+        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-2'],
+        location: { file: '/root/tests/sample.spec.ts', line: 10, column: 1 },
+      }),
+    ];
+    reporter.onBegin(fakeConfig(), suiteWithTests(tests));
+
+    const enriched = readState();
+    expect(new Set(enriched.flakyCandidates)).toEqual(
+      new Set(['tests/sample.spec.ts > new-test-1', 'tests/sample.spec.ts > new-test-2'])
+    );
+    expect(enriched.flakyPerTestDeadlineMs).toBeGreaterThan(0);
+  });
+
+  it('does nothing when flakyContext or flakyMode is absent', () => {
+    seedState({}); // no flaky block
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    reporter.onBegin(fakeConfig(), suiteWithTests([]));
+
+    const enriched = readState();
+    expect(enriched.flakyCandidates).toBeUndefined();
+    expect(enriched.flakyPerTestDeadlineMs).toBeUndefined();
+  });
+});
+
+describe('MergifyReporter — flaky-detection annotation pickup', () => {
+  beforeEach(() => {
+    vi.stubEnv('GITHUB_ACTIONS', 'true');
+    vi.stubEnv('GITHUB_REPOSITORY', 'test-owner/test-repo');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('parses mergify:flakyDetection annotation and populates testCaseResult.flakyDetection', async () => {
+    const exporter = new InMemorySpanExporter();
+    const reporter = new MergifyReporter({ exporter });
+    reporter.onBegin(fakeConfig(), fakeSuite());
+
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+      annotations: [
+        {
+          type: 'mergify:flakyDetection',
+          description: JSON.stringify({ new: true, flaky: true, rerunCount: 4 }),
+        },
+      ],
+    });
+    reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
+    await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
+
+    const session = reporter.getSession();
+    const tc = session?.testCases[0];
+    expect(tc?.flakyDetection).toEqual({ new: true, flaky: true, rerunCount: 4 });
+
+    const span = exporter.getFinishedSpans().find((s) => s.attributes['test.scope'] === 'case');
+    expect(span?.attributes['cicd.test.flaky_detection']).toBe(true);
+    expect(span?.attributes['cicd.test.new']).toBe(true);
+    expect(span?.attributes['cicd.test.flaky']).toBe(true);
+    expect(span?.attributes['cicd.test.rerun_count']).toBe(4);
+  });
+
+  it('skips malformed annotation descriptions silently', async () => {
+    const exporter = new InMemorySpanExporter();
+    const reporter = new MergifyReporter({ exporter });
+    reporter.onBegin(fakeConfig(), fakeSuite());
+    const test = fakeTest({
+      annotations: [{ type: 'mergify:flakyDetection', description: '{not json' }],
+    });
+    reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
+    await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
+
+    const tc = reporter.getSession()?.testCases[0];
+    expect(tc?.flakyDetection).toBeUndefined();
+  });
+});
+
+describe('MergifyReporter — flaky-detection summary block', () => {
+  let cacheRoot: string;
+  let statePath: string;
+
+  beforeEach(() => {
+    vi.stubEnv('GITHUB_ACTIONS', 'true');
+    vi.stubEnv('GITHUB_REPOSITORY', 'test-owner/test-repo');
+    cacheRoot = mkdtempSync(join(tmpdir(), 'mergify-flaky-summary-'));
+    statePath = stateFilePath(cacheRoot, 'run-99');
+    mkdirSync(dirname(statePath), { recursive: true });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        testRunId: 'run-99',
+        createdAt: '2026-04-29T00:00:00Z',
+        rootDir: '/root',
+        quarantinedTests: [],
+        flakyContext: {
+          budget_ratio_for_new_tests: 0.5,
+          budget_ratio_for_unhealthy_tests: 0.5,
+          existing_test_names: [],
+          existing_tests_mean_duration_ms: 100,
+          unhealthy_test_names: [],
+          max_test_execution_count: 5,
+          max_test_name_length: 200,
+          min_budget_duration_ms: 1_000,
+          min_test_execution_count: 3,
+        },
+        flakyMode: 'unhealthy',
+      })
+    );
+    process.env.MERGIFY_TEST_RUN_ID = 'run-99';
+    process.env.MERGIFY_STATE_FILE = statePath;
+  });
+
+  afterEach(() => {
+    rmSync(cacheRoot, { recursive: true, force: true });
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    delete process.env.MERGIFY_TEST_RUN_ID;
+    delete process.env.MERGIFY_STATE_FILE;
+  });
+
+  it('prints a summary when flakyMode is set', async () => {
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const exporter = new InMemorySpanExporter();
+    const reporter = new MergifyReporter({ exporter });
+    reporter.onBegin(fakeConfig(), fakeSuite());
+
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+      annotations: [
+        {
+          type: 'mergify:flakyDetection',
+          description: JSON.stringify({ new: false, flaky: true, rerunCount: 3 }),
+        },
+      ],
+    });
+    reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
+    await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
+
+    const out = log.mock.calls.map((c) => String(c[0])).join('');
+    expect(out).toContain('Flaky detection report');
+    expect(out).toContain('mode: unhealthy');
+    expect(out).toContain('Tests rerun: 1');
+    expect(out).toContain('Flaky tests detected: 1');
+    expect(out).toContain('tests/sample.spec.ts > a');
   });
 });

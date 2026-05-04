@@ -150,6 +150,19 @@ describe('FlakyDetector', () => {
       expect(summary.rerunTests[0].flaky).toBe(true);
     });
   });
+
+  describe('public fields', () => {
+    it('exposes candidates, mode, and perTestDeadlineMs as readonly properties', () => {
+      const allTests = ['test.ts > existing > test A', 'test.ts > new > test D'];
+      const detector = new FlakyDetector(baseContext, 'new', allTests);
+
+      expect(detector.candidates).toBeInstanceOf(Set);
+      expect(detector.candidates.has('test.ts > new > test D')).toBe(true);
+      expect(detector.mode).toBe('new');
+      expect(typeof detector.perTestDeadlineMs).toBe('number');
+      expect(detector.perTestDeadlineMs).toBeGreaterThan(0);
+    });
+  });
 });
 
 describe('fetchFlakyDetectionContext', () => {

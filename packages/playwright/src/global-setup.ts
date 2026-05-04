@@ -2,32 +2,21 @@ import { join } from 'node:path';
 import {
   detectResources,
   envToBool,
+  type FlakyDetectionContext,
+  fetchFlakyDetectionContext,
   fetchQuarantineList,
   generateTestRunId,
   getRepoName,
   isInCI,
 } from '@mergifyio/ci-core';
 import type { FullConfig } from '@playwright/test';
-import { type QuarantineState, stateFilePath, writeStateFile } from './state-file.js';
+import { type SharedState, stateFilePath, writeStateFile } from './state-file.js';
 
 const DEFAULT_API_URL = 'https://api.mergify.com';
 
 export interface RunGlobalSetupDeps {
   cacheRoot: string;
   now: () => Date;
-}
-
-/**
- * Resolve the branch name the same way the reporter would — by building the
- * OTel resource attributes once and looking up `vcs.ref.base.name`
- * (PR base, preferred) then `vcs.ref.head.name` (push branch / PR head).
- *
- * This matches `MergifyReporter.onBegin`'s lookup pattern exactly. The cost
- * is a single git CLI invocation that the reporter would do later anyway.
- */
-function resolveBranch(testRunId: string): string | undefined {
-  const attrs = detectResources({}, testRunId).attributes;
-  return (attrs['vcs.ref.base.name'] ?? attrs['vcs.ref.head.name']) as string | undefined;
 }
 
 export async function runGlobalSetup(config: FullConfig, deps: RunGlobalSetupDeps): Promise<void> {
@@ -41,7 +30,16 @@ export async function runGlobalSetup(config: FullConfig, deps: RunGlobalSetupDep
   const testRunId = generateTestRunId();
   process.env.MERGIFY_TEST_RUN_ID = testRunId;
 
-  const branch = resolveBranch(testRunId);
+  // Resolve the branch name the same way the reporter would — by building the
+  // OTel resource attributes once and looking up `vcs.ref.base.name` (PR base,
+  // preferred) then `vcs.ref.head.name` (push branch / PR head). Mode for
+  // flaky detection is derived from the same attribute split: a present base
+  // ref means PR-like context → "new" mode.
+  const attrs = detectResources({}, testRunId).attributes;
+  const baseRef = attrs['vcs.ref.base.name'] as string | undefined;
+  const headRef = attrs['vcs.ref.head.name'] as string | undefined;
+  const branch = baseRef ?? headRef;
+
   if (!token || !repoName || !branch) {
     return;
   }
@@ -53,12 +51,26 @@ export async function runGlobalSetup(config: FullConfig, deps: RunGlobalSetupDep
   // already surfaced the failure to the user.
   const list = await fetchQuarantineList({ apiUrl, token, repoName, branch }, log);
 
-  const state: QuarantineState = {
+  // Flaky detection — gated by the feature-flag env var. Same soft-fail
+  // shape as quarantine: any null return means feature dormant, not error.
+  let flakyContext: FlakyDetectionContext | undefined;
+  let flakyMode: 'new' | 'unhealthy' | undefined;
+  if (envToBool(process.env._MERGIFY_TEST_NEW_FLAKY_DETECTION, false)) {
+    const ctx = await fetchFlakyDetectionContext({ apiUrl, token, repoName }, log);
+    if (ctx) {
+      flakyContext = ctx;
+      flakyMode = baseRef ? 'new' : 'unhealthy';
+    }
+  }
+
+  const state: SharedState = {
     version: 1,
     testRunId,
     createdAt: deps.now().toISOString(),
     rootDir: config.rootDir,
     quarantinedTests: [...list],
+    ...(flakyContext && { flakyContext }),
+    ...(flakyMode && { flakyMode }),
   };
 
   const path = stateFilePath(deps.cacheRoot, testRunId);
