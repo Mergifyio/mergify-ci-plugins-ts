@@ -33,6 +33,7 @@ import { readStateFile } from './state-file.js';
 import type { MergifyReporterOptions } from './types.js';
 import {
   buildTestKey,
+  buildTestKeyParts,
   extractNamespace,
   mapStatus,
   projectNameFromTest,
@@ -51,7 +52,8 @@ export class MergifyReporter implements Reporter {
   private quarantineFetchedNames: string[] = [];
   private quarantinedCaught: string[] = [];
   private flakyResults: Array<{
-    name: string;
+    key: string;
+    project: string;
     new: boolean;
     flaky: boolean;
     rerunCount: number;
@@ -64,12 +66,23 @@ export class MergifyReporter implements Reporter {
   /** Buffer of (testCaseResult, key) pairs awaiting span emission. */
   private buffered: Array<{ result: TestCaseResult; key: string }> = [];
   /**
-   * Phase-1 outcomes for candidates that ran, deduplicated per key (so a
-   * multi-project suite contributes one entry per logical test, with failures
-   * preserved). Replayed into `flakyDetector.recordOutcome` at the start of
-   * onEnd, before phase-2 outcomes are merged in.
+   * Phase-1 outcomes for candidates that ran, indexed by `(key, project)`.
+   * Each Playwright project is tracked separately so the phase-2 budget,
+   * subprocess scoping, and span verdict are all project-aware. The inner
+   * key is the project name (or `''` for a no-project suite).
    */
-  private phase1Outcomes: Map<string, { status: 'pass' | 'fail'; duration: number }> = new Map();
+  private phase1Outcomes: Map<string, Map<string, { status: 'pass' | 'fail'; duration: number }>> =
+    new Map();
+  /**
+   * Un-joined `[filepath, ...describes, title]` segments per candidate key.
+   * Identical across projects for the same logical test, so stored once per
+   * key rather than once per (key, project). Used to rebuild `--test-list`
+   * lines at segment boundaries without running `replaceAll` over the joined
+   * key (which would corrupt a describe literally containing ` > `).
+   */
+  private candidateParts: Map<string, readonly string[]> = new Map();
+  /** Phase-2 attempt outcomes indexed by `(key, project)`. Populated from JSONL. */
+  private phase2Outcomes: Map<string, Map<string, Array<'pass' | 'fail'>>> = new Map();
 
   constructor(options?: MergifyReporterOptions) {
     this.options = options ?? {};
@@ -178,6 +191,7 @@ export class MergifyReporter implements Reporter {
       const key = buildTestKey(filepath, test.titlePath(), test.title);
       const line = `${JSON.stringify({
         key,
+        project: projectNameFromTest(test) ?? '',
         status: result.status,
         duration: result.duration,
       })}\n`;
@@ -239,18 +253,26 @@ export class MergifyReporter implements Reporter {
     // count and to seed the aggregation in onEnd. Skipped tests are excluded
     // — recording them as either pass or fail can produce misleading flaky
     // verdicts when phase 2 actually runs the test (rare but possible if
-    // skip conditions differ across phases).
+    // skip conditions differ across phases). The outcome is keyed by
+    // (key, project) so each project gets its own verdict. If the user has
+    // `repeatEach > 0` in their own config, the same `(key, project)` fires
+    // `isFinal` more than once — preserve a failure if already recorded so a
+    // later pass doesn't erase the signal phase 1 already gave us.
     if (this.flakyDetector?.isCandidate(key) && result.status !== 'skipped') {
       const phase1Status: 'pass' | 'fail' = result.status === 'passed' ? 'pass' : 'fail';
-      const existing = this.phase1Outcomes.get(key);
-      // In multi-project suites the same key appears once per project;
-      // preserve a failure if already recorded so cross-project flakiness
-      // is not masked by a later passing project.
+      const projectKey = project ?? '';
+      let perProject = this.phase1Outcomes.get(key);
+      if (!perProject) {
+        perProject = new Map();
+        this.phase1Outcomes.set(key, perProject);
+      }
+      const existing = perProject.get(projectKey);
       if (!existing || existing.status !== 'fail') {
-        this.phase1Outcomes.set(key, {
-          status: phase1Status,
-          duration: result.duration,
-        });
+        perProject.set(projectKey, { status: phase1Status, duration: result.duration });
+      }
+      // Parts are identical across projects for the same key — store once.
+      if (!this.candidateParts.has(key)) {
+        this.candidateParts.set(key, buildTestKeyParts(filepath, titlePath, test.title));
       }
     }
 
@@ -281,53 +303,66 @@ export class MergifyReporter implements Reporter {
     this.session.endTime = Date.now();
     this.session.status = reason;
 
-    // Replay deduplicated phase-1 outcomes into the FlakyDetector so it sees
-    // exactly one initial attempt per candidate before any phase-2 outcomes
-    // are merged in. This mirrors the in-process Vitest pattern (one
-    // recordOutcome per attempt) — the only difference is that we batch the
-    // phase-1 recordings here instead of recording in onTestEnd, so that the
-    // multi-project dedup logic still applies.
-    if (this.flakyDetector) {
-      for (const [key, { status }] of this.phase1Outcomes) {
-        this.flakyDetector.recordOutcome(key, status);
-      }
-    }
-
-    // Phase 2: spawn rerun subprocess for any candidates that ran.
-    // Skip when interrupted — spawning a blocking subprocess after a
-    // timeout or SIGTERM would delay process exit further.
-    if (this.flakyDetector && reason !== 'interrupted') {
+    // Phase 2 + aggregation are both skipped on an interrupted run.
+    // Spawning a blocking subprocess after a SIGTERM or test-timeout would
+    // delay process exit further, and emitting a `flaky: false` verdict from
+    // phase 1 alone would falsely declare un-rerun candidates non-flaky.
+    if (this.flakyDetector && this.flakyMode && reason !== 'interrupted') {
       await this.runFlakyDetectionPhase2(this.flakyDetector);
-    }
 
-    // Augment buffered TestCaseResults with flakyDetection metadata before
-    // emitting spans. In multi-project suites the same key appears once per
-    // project — compute the verdict once and apply it to every matching entry,
-    // but only push to flakyResults once per unique key.
-    const processedFlakyKeys = new Set<string>();
-    for (const { result: tcr, key } of this.buffered) {
-      if (!this.flakyDetector?.isCandidate(key) || !this.flakyMode) continue;
-      // Skip candidates we never measured (skipped in phase 1 and not rerun)
-      // — otherwise we'd emit a misleading `flaky: false` verdict on a test
-      // the pipeline never actually evaluated.
-      if (!this.phase1Outcomes.has(key)) continue;
-
-      const isFlaky = this.flakyDetector.isFlaky(key);
-      const rerunCount = this.flakyDetector.getRerunCount(key);
-
-      tcr.flakyDetection = {
-        new: this.flakyMode === 'new',
-        flaky: isFlaky,
-        rerunCount,
-      };
-      if (!processedFlakyKeys.has(key)) {
-        processedFlakyKeys.add(key);
-        this.flakyResults.push({
-          name: key,
+      // Each (key, project) is its own verdict: phase 1 contributed exactly
+      // one outcome for that pair, and phase 2 may have contributed N more
+      // (the subprocess ran the test under that project specifically, via
+      // the `[project] › key` test-list line). Cross-project disagreement
+      // is NOT counted as flakiness — that's behavioural drift, not the
+      // time-dependent flakiness we're trying to detect.
+      //
+      // The same `(key, project)` can appear more than once in `buffered`
+      // (e.g. when the user's own config has `repeatEach > 0`). We compute
+      // the verdict once per pair, attach it to every matching buffered
+      // span so all OTLP spans carry the same flakyDetection block, and
+      // push to flakyResults exactly once.
+      // `null` is the "no data" sentinel — distinct from `undefined`
+      // (not-yet-computed) so duplicate buffered entries for a skipped
+      // candidate fast-path on subsequent iterations.
+      const verdicts = new Map<string, { isFlaky: boolean; rerunCount: number } | null>();
+      for (const { result: tcr, key } of this.buffered) {
+        if (!this.flakyDetector.isCandidate(key)) continue;
+        const projectKey = tcr.project ?? '';
+        const pairKey = `${key}\0${projectKey}`;
+        let verdict = verdicts.get(pairKey);
+        if (verdict === undefined) {
+          const phase1 = this.phase1Outcomes.get(key)?.get(projectKey);
+          const phase2 = this.phase2Outcomes.get(key)?.get(projectKey) ?? [];
+          if (!phase1 && phase2.length === 0) {
+            // Skip candidates we never measured (skipped in phase 1 and
+            // not rerun) — otherwise we'd emit a misleading `flaky: false`
+            // verdict on a test the pipeline never actually evaluated.
+            verdicts.set(pairKey, null);
+            continue;
+          }
+          const allOutcomes: Array<'pass' | 'fail'> = [];
+          if (phase1) allOutcomes.push(phase1.status);
+          allOutcomes.push(...phase2);
+          verdict = {
+            isFlaky: allOutcomes.includes('pass') && allOutcomes.includes('fail'),
+            rerunCount: phase2.length,
+          };
+          verdicts.set(pairKey, verdict);
+          this.flakyResults.push({
+            key,
+            project: projectKey,
+            new: this.flakyMode === 'new',
+            flaky: verdict.isFlaky,
+            rerunCount: verdict.rerunCount,
+          });
+        }
+        if (!verdict) continue;
+        tcr.flakyDetection = {
           new: this.flakyMode === 'new',
-          flaky: isFlaky,
-          rerunCount,
-        });
+          flaky: verdict.isFlaky,
+          rerunCount: verdict.rerunCount,
+        };
       }
     }
 
@@ -356,8 +391,10 @@ export class MergifyReporter implements Reporter {
       }
     }
 
-    // Flaky detection summary
-    if (this.flakyMode) {
+    // Flaky detection summary. Mirror the same `!== 'interrupted'` gate as
+    // phase 2: if the run was aborted, `flakyResults` is empty and emitting
+    // 'Tests rerun: 0' would falsely suggest detection ran cleanly.
+    if (this.flakyMode && reason !== 'interrupted') {
       process.stderr.write('[@mergifyio/playwright] Flaky detection report:\n');
       process.stderr.write(`  mode: ${this.flakyMode}\n`);
       process.stderr.write(`  Tests rerun: ${this.flakyResults.length}\n`);
@@ -365,7 +402,8 @@ export class MergifyReporter implements Reporter {
       const flakyTests = this.flakyResults.filter((r) => r.flaky);
       process.stderr.write(`  Flaky tests detected: ${flakyTests.length}\n`);
       for (const t of flakyTests) {
-        process.stderr.write(`    - ${t.name} (reruns: ${t.rerunCount})\n`);
+        const display = t.project ? `${t.key} [${t.project}]` : t.key;
+        process.stderr.write(`    - ${display} (reruns: ${t.rerunCount})\n`);
       }
     }
 
@@ -381,19 +419,35 @@ export class MergifyReporter implements Reporter {
 
   /**
    * If any flaky-detection candidates ran, spawn a single subprocess that
-   * re-runs them via `--test-list <file> --repeat-each=N`. Records each
-   * phase-2 outcome on the detector. Soft-fails on subprocess errors — they
-   * are logged but never propagated.
+   * re-runs them via `--test-list <file> --repeat-each=N`. Each `(key, project)`
+   * pair gets its own line in the test list, so Playwright runs each candidate
+   * only in the project where it actually ran in phase 1 (avoiding the
+   * P × repeatEach fan-out a project-agnostic line would cause). Phase-2
+   * outcomes are stored on the instance for the aggregation step in `onEnd`.
+   * Soft-fails on subprocess errors — they are logged but never propagated.
    */
   private async runFlakyDetectionPhase2(flakyDetector: FlakyDetector): Promise<void> {
-    if (this.phase1Outcomes.size === 0) return;
+    // Flatten (key, project, entry) tuples once — used for budget, test-list,
+    // and timeout math. Empty when nothing ran in phase 1.
+    const candidates: Array<{
+      key: string;
+      project: string;
+      duration: number;
+      parts: readonly string[];
+    }> = [];
+    for (const [key, perProject] of this.phase1Outcomes) {
+      const parts = this.candidateParts.get(key);
+      if (!parts) continue; // shouldn't happen — parts is set whenever phase 1 is recorded
+      for (const [project, entry] of perProject) {
+        candidates.push({ key, project, duration: entry.duration, parts });
+      }
+    }
+    if (candidates.length === 0) return;
 
-    // Compute repeat-each from the average phase-1 duration. Playwright
-    // reports 0ms for very fast tests; we fall back to a 1ms floor so the
-    // budget math doesn't divide by zero.
-    const durations = [...this.phase1Outcomes.values()].map((v) => v.duration);
-    const avgDuration =
-      durations.length > 0 ? durations.reduce((a, b) => a + b, 0) / durations.length : 0;
+    // Compute repeat-each from the average phase-1 duration across all
+    // (key, project) pairs. Playwright reports 0ms for very fast tests; we
+    // fall back to a 1ms floor so the budget math doesn't divide by zero.
+    const avgDuration = candidates.reduce((sum, c) => sum + c.duration, 0) / candidates.length;
     const effectiveDuration = Math.max(1, avgDuration);
     const repeatEach = flakyDetector.computeRepeatBudget(effectiveDuration);
     if (repeatEach < 1) return;
@@ -411,23 +465,56 @@ export class MergifyReporter implements Reporter {
     const suffix = `${runId}-${process.pid}-${randomBytes(4).toString('hex')}`;
     const rerunFile = join(tmpdir(), `mergify-rerun-${suffix}.jsonl`);
     // `--test-list` takes a file with one test ID per line in `--list` format.
-    // Our `buildTestKey` output (`<filepath> > <suite> > <title>`) is exactly
-    // that format — Playwright accepts `>` and `›` interchangeably. This is
-    // exact-match (vs `--grep` which over-matches on leaf title across files).
+    // The `[project] › <segments…>` prefix scopes each line to the project
+    // the test actually ran in during phase 1, avoiding the cross-project
+    // fan-out an unqualified line would trigger. We build each line from the
+    // raw `[filepath, ...describes, title]` segments (joined with `›`) rather
+    // than `replaceAll`-ing the joined key — that way a describe whose name
+    // literally contains ` > ` doesn't get its separator promoted and
+    // silently mismatched.
+    //
+    // Playwright's parser still can't disambiguate the line when a segment
+    // contains its own ` › ` separator or when the project name contains
+    // a closing `]` (the bracket scan terminates at the first `]`). We
+    // can't encode those candidates safely, so we drop them with a stderr
+    // warning rather than producing a silent false-negative verdict.
+    const safe: typeof candidates = [];
+    const unsafe: typeof candidates = [];
+    for (const c of candidates) {
+      const projectOk = !c.project.includes(']');
+      const partsOk = c.parts.every((p) => !p.includes(' › '));
+      (projectOk && partsOk ? safe : unsafe).push(c);
+    }
+    if (unsafe.length > 0) {
+      process.stderr.write(
+        `[@mergifyio/playwright] skipping ${unsafe.length} flaky-detection ` +
+          'candidate(s) whose project name contains `]` or whose describe/title ' +
+          'contains ` › ` — Playwright `--test-list` cannot disambiguate them:\n'
+      );
+      for (const c of unsafe) {
+        const id = c.project ? `${c.key} [${c.project}]` : c.key;
+        process.stderr.write(`    - ${id}\n`);
+      }
+    }
+    if (safe.length === 0) return;
+    const testListLines = safe.map(({ project, parts }) => {
+      const path = parts.join(' › ');
+      return project ? `[${project}] › ${path}` : path;
+    });
     const testListFile = join(tmpdir(), `mergify-tests-${suffix}.txt`);
-    writeFileSync(testListFile, `${[...this.phase1Outcomes.keys()].join('\n')}\n`);
+    writeFileSync(testListFile, `${testListLines.join('\n')}\n`);
 
     const spawnEnv = {
       ...process.env,
       MERGIFY_RERUN_FILE: rerunFile,
     };
 
-    // --retries=0: phase-2 measures raw pass/fail per attempt; built-in
-    // retries would mask underlying failures and inflate JSONL entries.
-    const timeoutMs = Math.max(
-      effectiveDuration * (repeatEach + 1) * this.phase1Outcomes.size + 60_000,
-      120_000
-    );
+    // Total wall-clock upper bound: phase 2 is purely reruns (no separate
+    // "initial" attempt), and `--repeat-each=N` means N runs per test, so
+    // each `(key, project)` pair runs exactly `repeatEach` times. 60s
+    // headroom for overhead. 120s floor so trivially-fast suites still get
+    // a real timeout.
+    const timeoutMs = Math.max(effectiveDuration * repeatEach * safe.length + 60_000, 120_000);
     const child = spawnSync(
       process.execPath,
       [
@@ -466,7 +553,12 @@ export class MergifyReporter implements Reporter {
     } catch {
       raw = '';
     }
-    const exitedAbnormally = child.error || (child.status !== null && child.status !== 0);
+    // `child.status !== 0` covers BOTH non-zero exit codes AND signal kills:
+    // when Node SIGTERMs the child on timeout, `child.status` is `null` and
+    // `null !== 0` is `true`. The earlier check `child.status !== null && …`
+    // was the bug — that clause excluded the timeout path and let it slip
+    // through silently.
+    const exitedAbnormally = child.error !== undefined || child.status !== 0;
     if (exitedAbnormally && raw.trim().length === 0) {
       const detail = [child.stdout, child.stderr]
         .filter((s) => s && s.trim().length > 0)
@@ -485,12 +577,26 @@ export class MergifyReporter implements Reporter {
       try {
         const parsed = JSON.parse(line) as {
           key?: unknown;
+          project?: unknown;
           status?: unknown;
         };
         if (typeof parsed.key !== 'string' || typeof parsed.status !== 'string') continue;
-        // Skipped attempts don't contribute to the flaky verdict — drop them.
-        if (parsed.status === 'passed') flakyDetector.recordOutcome(parsed.key, 'pass');
-        else if (parsed.status === 'failed') flakyDetector.recordOutcome(parsed.key, 'fail');
+        // Phase-1 maps any non-`'passed'`/non-`'skipped'` status (failed,
+        // timedOut, interrupted) to `'fail'`. Mirror that here so a test
+        // that times out in every phase-2 rerun isn't silently dropped from
+        // the verdict — without this, phase1=fail + phase2=[] yields
+        // isFlaky=false instead of "consistently broken".
+        if (parsed.status === 'skipped') continue;
+        const project = typeof parsed.project === 'string' ? parsed.project : '';
+        const outcome = parsed.status === 'passed' ? 'pass' : 'fail';
+        let perProject = this.phase2Outcomes.get(parsed.key);
+        if (!perProject) {
+          perProject = new Map();
+          this.phase2Outcomes.set(parsed.key, perProject);
+        }
+        const list = perProject.get(project) ?? [];
+        list.push(outcome);
+        perProject.set(project, list);
       } catch {
         // skip malformed line
       }

@@ -16,9 +16,13 @@ interface MockInfo {
 }
 
 function mockInfo(overrides: Partial<MockInfo> = {}): MockInfo {
+  // `TestInfo.titlePath` (unlike `TestCase.titlePath()`) has shape
+  // `[file, ...describes, title]` — no project, no leading empty entry. The
+  // file segment is relative to the test root, which matches what
+  // `applyQuarantine`'s `relative(rootDir, testInfo.file)` produces.
   return {
     title: 'adds numbers',
-    titlePath: ['chromium', '/repo/tests/math.spec.ts', 'math', 'adds numbers'],
+    titlePath: ['tests/math.spec.ts', 'math', 'adds numbers'],
     file: '/repo/tests/math.spec.ts',
     status: 'passed',
     expectedStatus: 'passed',
@@ -48,7 +52,7 @@ describe('applyQuarantine', () => {
     const info = mockInfo({
       status: 'failed',
       title: 'other',
-      titlePath: ['chromium', '/repo/tests/math.spec.ts', 'math', 'other'],
+      titlePath: ['tests/math.spec.ts', 'math', 'other'],
     });
     applyQuarantine({ testInfo: info as never, quarantineSet, rootDir: '/repo' });
     expect(info.expectedStatus).toBe('passed');

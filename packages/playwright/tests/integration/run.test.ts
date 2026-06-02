@@ -184,8 +184,11 @@ function seedFlakyState(opts: {
   );
 }
 
-function runFlakyFixture(envOverrides: Record<string, string>): ReturnType<typeof spawnSync> {
-  return spawnSync(playwrightBin, ['test', '--config', join(fixtureRoot, 'playwright.config.ts')], {
+function runFlakyFixture(
+  envOverrides: Record<string, string>,
+  configFile = 'playwright.config.ts'
+): ReturnType<typeof spawnSync> {
+  return spawnSync(playwrightBin, ['test', '--config', join(fixtureRoot, configFile)], {
     cwd: fixtureRoot,
     env: {
       ...process.env,
@@ -247,4 +250,68 @@ describe('integration: flaky detection — new mode', () => {
     expect(combined).toContain('Flaky tests detected: 1');
     expect(combined).toContain('sample.spec.ts > flaky-test');
   }, 90_000);
+});
+
+describe('integration: flaky detection — describe-nested candidate', () => {
+  it('round-trips a describe-nested key through phase-2 --test-list', () => {
+    // The candidate key is `sample.spec.ts > Outer > flaky-test`. Exercises
+    // the describe-segment branch of extractNamespace + the file-suite
+    // stripping in stripFileSuite + the test-list `>`/`›` separator
+    // handling — the riskiest corners of the buildTestKey ↔ --test-list
+    // round-trip that the flat fixture above does not cover.
+    const counterPath = join(cacheRoot, 'flaky-counter-nested');
+    seedFlakyState({
+      mode: 'unhealthy',
+      rootDir: join(fixtureRoot, 'tests-unhealthy-nested'),
+      unhealthyTestNames: ['sample.spec.ts > Outer > flaky-test'],
+    });
+
+    const result = runFlakyFixture({
+      PW_FIXTURE_DIR: './tests-unhealthy-nested',
+      FLAKY_COUNTER_PATH: counterPath,
+    });
+
+    const combined = `${result.stdout}\n${result.stderr}`;
+    expect(result.status).toBe(0);
+    expect(combined).toContain('Flaky detection report');
+    expect(combined).toContain('Tests rerun: 1');
+    expect(combined).toContain('Flaky tests detected: 1');
+    expect(combined).toContain('sample.spec.ts > Outer > flaky-test');
+  }, 90_000);
+});
+
+describe('integration: flaky detection — multi-project suite', () => {
+  it('runs each candidate only in its own project and emits per-project verdicts', () => {
+    // Two projects (node-a, node-b) share the same spec. Each project has
+    // its own counter, so phase 1 fails in BOTH projects (deterministic per
+    // project). Phase 2 then reruns each `(key, project)` pair via the
+    // `[project] › <key>` test-list lines — without that scoping, the
+    // subprocess would fan each line out across all projects and inflate
+    // both the rerun count and the wall-clock budget by P.
+    const counterPath = join(cacheRoot, 'flaky-counter-multi');
+    seedFlakyState({
+      mode: 'unhealthy',
+      rootDir: join(fixtureRoot, 'tests-unhealthy'),
+      unhealthyTestNames: ['sample.spec.ts > flaky-test'],
+    });
+
+    const result = runFlakyFixture(
+      {
+        PW_FIXTURE_DIR: './tests-unhealthy',
+        FLAKY_COUNTER_PATH: counterPath,
+      },
+      'playwright-multiproject.config.ts'
+    );
+
+    const combined = `${result.stdout}\n${result.stderr}`;
+    expect(result.status).toBe(0);
+    expect(combined).toContain('Flaky detection report');
+    expect(combined).toContain('mode: unhealthy');
+    // One `(key, project)` verdict per project — multi-project users see two
+    // rows in the summary, both flagged flaky.
+    expect(combined).toContain('Tests rerun: 2');
+    expect(combined).toContain('Flaky tests detected: 2');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node-a]');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node-b]');
+  }, 120_000);
 });

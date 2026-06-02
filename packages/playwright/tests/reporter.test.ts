@@ -26,9 +26,20 @@ function fakeTest(
     annotations?: Array<{ type: string; description?: string }>;
   } = {}
 ): TestCase {
+  const titlePath = overrides.titlePath ?? ['chromium', '/root/tests/x.spec.ts', 'my test'];
+  // Mock parent chain. `projectNameFromTest` resolves the project via
+  // `test.parent.project()` (the only reliable source in real Playwright),
+  // so the default mock derives the project name from titlePath[0] — that
+  // way existing tests that vary `titlePath: ['firefox', ...]` get a
+  // matching project without each having to wire up a custom parent.
+  const projectName = titlePath[0] ?? '';
+  const defaultParent =
+    projectName.length > 0
+      ? { project: () => ({ name: projectName }) }
+      : { project: () => undefined };
   return {
     title: overrides.title ?? 'my test',
-    titlePath: () => overrides.titlePath ?? ['chromium', '/root/tests/x.spec.ts', 'my test'],
+    titlePath: () => titlePath,
     location: overrides.location ?? {
       file: '/root/tests/x.spec.ts',
       line: 42,
@@ -36,7 +47,7 @@ function fakeTest(
     },
     retries: overrides.retries ?? 0,
     results: [] as TestResult[],
-    parent: overrides.parent ?? ({ project: () => ({ name: 'chromium' }) } as unknown),
+    parent: overrides.parent ?? (defaultParent as unknown),
     outcome: overrides.outcome ?? (() => 'expected'),
     annotations: overrides.annotations ?? [],
   } as unknown as TestCase;

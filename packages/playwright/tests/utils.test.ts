@@ -77,18 +77,37 @@ describe('mapStatus', () => {
 });
 
 describe('projectNameFromTest', () => {
-  it('returns the first entry of titlePath as the project name', () => {
+  it('reads the project name from the parent suite', () => {
     const fakeTest = {
-      titlePath: () => ['firefox', 'tests/x.spec.ts', 'my test'],
+      parent: { project: () => ({ name: 'firefox' }) },
     } as unknown as Parameters<typeof projectNameFromTest>[0];
     expect(projectNameFromTest(fakeTest)).toBe('firefox');
   });
 
-  it('returns undefined when titlePath first entry is empty', () => {
+  it('returns undefined when no parent suite carries a project', () => {
     const fakeTest = {
-      titlePath: () => ['', 'tests/x.spec.ts', 'my test'],
+      parent: { project: () => undefined },
     } as unknown as Parameters<typeof projectNameFromTest>[0];
     expect(projectNameFromTest(fakeTest)).toBeUndefined();
+  });
+
+  it('returns undefined when the parent chain reports an empty project name', () => {
+    const fakeTest = {
+      parent: { project: () => ({ name: '' }) },
+    } as unknown as Parameters<typeof projectNameFromTest>[0];
+    expect(projectNameFromTest(fakeTest)).toBeUndefined();
+  });
+
+  it('walks up the parent chain to find the project (real Playwright nests file/describe suites below the project)', () => {
+    const fakeTest = {
+      parent: {
+        project: () => undefined,
+        parent: {
+          project: () => ({ name: 'chromium' }),
+        },
+      },
+    } as unknown as Parameters<typeof projectNameFromTest>[0];
+    expect(projectNameFromTest(fakeTest)).toBe('chromium');
   });
 });
 
