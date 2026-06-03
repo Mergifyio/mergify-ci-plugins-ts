@@ -32,8 +32,10 @@ import * as playwrightResource from './resources/playwright.js';
 import { readStateFile } from './state-file.js';
 import type { MergifyReporterOptions } from './types.js';
 import {
+  buildTestFunction,
   buildTestKey,
   extractNamespace,
+  formatTestListLine,
   mapStatus,
   projectNameFromTest,
   toPosix,
@@ -64,12 +66,17 @@ export class MergifyReporter implements Reporter {
   /** Buffer of (testCaseResult, key) pairs awaiting span emission. */
   private buffered: Array<{ result: TestCaseResult; key: string }> = [];
   /**
-   * Phase-1 outcomes for candidates that ran, deduplicated per key (so a
-   * multi-project suite contributes one entry per logical test, with failures
-   * preserved). Replayed into `flakyDetector.recordOutcome` at the start of
-   * onEnd, before phase-2 outcomes are merged in.
+   * Phase-1 outcomes for candidates that ran. The key includes the project
+   * suffix (via `buildTestKey`), so multi-project suites contribute one entry
+   * per `(test, project)` pair without any dedup logic. Replayed into
+   * `flakyDetector.recordOutcome` at the start of onEnd, before phase-2
+   * outcomes are merged in. The project is kept alongside so phase-2 can
+   * write `[project] › bareKey` lines into the Playwright `--test-list` file.
    */
-  private phase1Outcomes: Map<string, { status: 'pass' | 'fail'; duration: number }> = new Map();
+  private phase1Outcomes: Map<
+    string,
+    { status: 'pass' | 'fail'; duration: number; project: string | undefined }
+  > = new Map();
 
   constructor(options?: MergifyReporterOptions) {
     this.options = options ?? {};
@@ -201,7 +208,12 @@ export class MergifyReporter implements Reporter {
     const testCaseResult: TestCaseResult = {
       filepath,
       absoluteFilepath,
-      function: test.title,
+      // The function field is decorated with the project so the emitted span
+      // name (`namespace > function`) matches `key` byte-for-byte. The
+      // backend stores this string as `test_name`; without the suffix it
+      // would collapse cross-project results back to a single record and
+      // recreate the false-absorption hazard buildTestKey fixes.
+      function: buildTestFunction(test.title, project),
       lineno: test.location?.line ?? 0,
       namespace,
       scope: 'case',
@@ -239,19 +251,17 @@ export class MergifyReporter implements Reporter {
     // count and to seed the aggregation in onEnd. Skipped tests are excluded
     // — recording them as either pass or fail can produce misleading flaky
     // verdicts when phase 2 actually runs the test (rare but possible if
-    // skip conditions differ across phases).
+    // skip conditions differ across phases). With the project baked into
+    // `key` there is at most one entry per `(test, project)` pair, so no
+    // dedup is needed; the `project` field is carried so phase-2 can write
+    // `[project] › bareKey` --test-list lines.
     if (this.flakyDetector?.isCandidate(key) && result.status !== 'skipped') {
       const phase1Status: 'pass' | 'fail' = result.status === 'passed' ? 'pass' : 'fail';
-      const existing = this.phase1Outcomes.get(key);
-      // In multi-project suites the same key appears once per project;
-      // preserve a failure if already recorded so cross-project flakiness
-      // is not masked by a later passing project.
-      if (!existing || existing.status !== 'fail') {
-        this.phase1Outcomes.set(key, {
-          status: phase1Status,
-          duration: result.duration,
-        });
-      }
+      this.phase1Outcomes.set(key, {
+        status: phase1Status,
+        duration: result.duration,
+        project,
+      });
     }
 
     this.session.testCases.push(testCaseResult);
@@ -301,10 +311,9 @@ export class MergifyReporter implements Reporter {
     }
 
     // Augment buffered TestCaseResults with flakyDetection metadata before
-    // emitting spans. In multi-project suites the same key appears once per
-    // project — compute the verdict once and apply it to every matching entry,
-    // but only push to flakyResults once per unique key.
-    const processedFlakyKeys = new Set<string>();
+    // emitting spans. With project baked into the key each `(test, project)`
+    // is its own buffer entry, its own phase-1 outcome, and its own
+    // flakyResults row — no dedup logic needed.
     for (const { result: tcr, key } of this.buffered) {
       if (!this.flakyDetector?.isCandidate(key) || !this.flakyMode) continue;
       // Skip candidates we never measured (skipped in phase 1 and not rerun)
@@ -320,15 +329,12 @@ export class MergifyReporter implements Reporter {
         flaky: isFlaky,
         rerunCount,
       };
-      if (!processedFlakyKeys.has(key)) {
-        processedFlakyKeys.add(key);
-        this.flakyResults.push({
-          name: key,
-          new: this.flakyMode === 'new',
-          flaky: isFlaky,
-          rerunCount,
-        });
-      }
+      this.flakyResults.push({
+        name: key,
+        new: this.flakyMode === 'new',
+        flaky: isFlaky,
+        rerunCount,
+      });
     }
 
     // Emit all buffered spans now.
@@ -410,12 +416,18 @@ export class MergifyReporter implements Reporter {
     const runId = process.env.MERGIFY_TEST_RUN_ID ?? generateTestRunId();
     const suffix = `${runId}-${process.pid}-${randomBytes(4).toString('hex')}`;
     const rerunFile = join(tmpdir(), `mergify-rerun-${suffix}.jsonl`);
-    // `--test-list` takes a file with one test ID per line in `--list` format.
-    // Our `buildTestKey` output (`<filepath> > <suite> > <title>`) is exactly
-    // that format — Playwright accepts `>` and `›` interchangeably. This is
-    // exact-match (vs `--grep` which over-matches on leaf title across files).
+    // `--test-list` takes a file with one test ID per line in `--list` format
+    // (`[project] › <filepath> › <suite> › <title>`). Each candidate's key
+    // has the project baked into the suffix (`buildTestKey`); strip it back
+    // out and write it as the `[project] ›` prefix so Playwright scopes the
+    // rerun to the originating project only — without that, the subprocess
+    // would fan each line across every project and inflate both rerun count
+    // and wall-clock budget by P.
     const testListFile = join(tmpdir(), `mergify-tests-${suffix}.txt`);
-    writeFileSync(testListFile, `${[...this.phase1Outcomes.keys()].join('\n')}\n`);
+    const lines = [...this.phase1Outcomes.entries()].map(([key, { project }]) =>
+      formatTestListLine(key, project)
+    );
+    writeFileSync(testListFile, `${lines.join('\n')}\n`);
 
     const spawnEnv = {
       ...process.env,

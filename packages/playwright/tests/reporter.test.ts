@@ -28,7 +28,11 @@ function fakeTest(
 ): TestCase {
   return {
     title: overrides.title ?? 'my test',
-    titlePath: () => overrides.titlePath ?? ['chromium', '/root/tests/x.spec.ts', 'my test'],
+    // Real Playwright shape: ['', project, basename, ...describes, title].
+    // The file-suite slot is the basename (`x.spec.ts`), NOT the absolute
+    // path — stripFileSuite recognises basename / relative-from-rootDir; an
+    // absolute path leaks into the namespace and breaks buildTestKey.
+    titlePath: () => overrides.titlePath ?? ['', 'chromium', 'x.spec.ts', 'my test'],
     location: overrides.location ?? {
       file: '/root/tests/x.spec.ts',
       line: 42,
@@ -119,7 +123,7 @@ describe('onTestEnd — passing test', () => {
     reporter.onBegin(fakeConfig(), fakeSuite());
     const test = fakeTest({
       title: 'adds numbers',
-      titlePath: ['chromium', '/root/tests/math.spec.ts', 'math', 'adds numbers'],
+      titlePath: ['', 'chromium', 'math.spec.ts', 'math', 'adds numbers'],
       location: { file: '/root/tests/math.spec.ts', line: 15, column: 3 },
     });
     reporter.onTestEnd(test, fakeResult({ status: 'passed', duration: 5 }));
@@ -128,7 +132,10 @@ describe('onTestEnd — passing test', () => {
     const spans = exporter.getFinishedSpans();
     const testSpan = spans.find((s) => s.attributes['test.scope'] === 'case');
     expect(testSpan).toBeDefined();
-    expect(testSpan!.attributes['code.function']).toBe('adds numbers');
+    // function is decorated with [project] so the span name (namespace > function)
+    // is byte-identical to buildTestKey's output — the backend stores this as
+    // test_name and matches it against per-project quarantine / unhealthy lists.
+    expect(testSpan!.attributes['code.function']).toBe('adds numbers [chromium]');
     expect(testSpan!.attributes['code.namespace']).toBe('tests/math.spec.ts > math');
     expect(testSpan!.attributes['code.lineno']).toBe(15);
     expect(testSpan!.attributes['code.filepath']).toBe('tests/math.spec.ts');
@@ -148,7 +155,7 @@ describe('onTestEnd — passing test', () => {
     const session = reporter.getSession()!;
     expect(session.testCases).toHaveLength(1);
     expect(session.testCases[0].status).toBe('passed');
-    expect(session.testCases[0].function).toBe('my test');
+    expect(session.testCases[0].function).toBe('my test [chromium]');
   });
 
   it('makes the test case span a child of the session span', async () => {
@@ -327,11 +334,11 @@ describe('onTestEnd — multi-project', () => {
 
     const chromium = fakeTest({
       title: 'same test',
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'same test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'same test'],
     });
     const firefox = fakeTest({
       title: 'same test',
-      titlePath: ['firefox', '/root/tests/x.spec.ts', 'same test'],
+      titlePath: ['', 'firefox', 'x.spec.ts', 'same test'],
     });
 
     reporter.onTestEnd(chromium, fakeResult());
@@ -349,7 +356,7 @@ describe('onTestEnd — multi-project', () => {
 
     reporter.onBegin(fakeConfig(), fakeSuite());
     const test = fakeTest({
-      titlePath: ['', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', '', 'x.spec.ts', 'my test'],
     });
     reporter.onTestEnd(test, fakeResult());
     await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
@@ -472,7 +479,7 @@ describe('MergifyReporter V2 — quarantine', () => {
         testRunId: 'abc123def456',
         createdAt: '2026-04-21T16:07:42Z',
         rootDir: '/root',
-        quarantinedTests: ['tests/x.spec.ts > my test'],
+        quarantinedTests: ['tests/x.spec.ts > my test [chromium]'],
       })
     );
     process.env.MERGIFY_TEST_RUN_ID = 'abc123def456';
@@ -502,7 +509,7 @@ describe('MergifyReporter V2 — quarantine', () => {
 
     // Attach the annotation the fixture would have pushed.
     const test = fakeTest({
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'my test'],
       location: { file: '/root/tests/x.spec.ts', line: 1, column: 1 },
       annotations: [{ type: 'mergify:quarantined' }],
     });
@@ -523,7 +530,7 @@ describe('MergifyReporter V2 — quarantine', () => {
     reporter.onBegin(fakeConfig(), fakeSuite());
 
     const test = fakeTest({
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'my test'],
       location: { file: '/root/tests/x.spec.ts', line: 1, column: 1 },
       annotations: [{ type: 'mergify:quarantined' }],
     });
@@ -534,7 +541,7 @@ describe('MergifyReporter V2 — quarantine', () => {
     expect(output).toContain('Quarantine report');
     expect(output).toContain('fetched: 1');
     expect(output).toContain('caught:  1');
-    expect(output).toContain('    - tests/x.spec.ts > my test');
+    expect(output).toContain('    - tests/x.spec.ts > my test [chromium]');
     expect(output).toContain('unused:  0');
   });
 
@@ -595,7 +602,7 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
       flakyContext: {
         budget_ratio_for_new_tests: 0.5,
         budget_ratio_for_unhealthy_tests: 0.5,
-        existing_test_names: ['tests/sample.spec.ts > existing-test'],
+        existing_test_names: ['tests/sample.spec.ts > existing-test [proj]'],
         existing_tests_mean_duration_ms: 100,
         unhealthy_test_names: [],
         max_test_execution_count: 5,
@@ -610,24 +617,27 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
     const tests = [
       fakeTest({
         title: 'existing-test',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'existing-test'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'existing-test'],
         location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
       }),
       fakeTest({
         title: 'new-test-1',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-1'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'new-test-1'],
         location: { file: '/root/tests/sample.spec.ts', line: 5, column: 1 },
       }),
       fakeTest({
         title: 'new-test-2',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-2'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'new-test-2'],
         location: { file: '/root/tests/sample.spec.ts', line: 10, column: 1 },
       }),
     ];
     reporter.onBegin(fakeConfig(), suiteWithTests(tests));
 
     expect(new Set(reporter.getFlakyCandidates())).toEqual(
-      new Set(['tests/sample.spec.ts > new-test-1', 'tests/sample.spec.ts > new-test-2'])
+      new Set([
+        'tests/sample.spec.ts > new-test-1 [proj]',
+        'tests/sample.spec.ts > new-test-2 [proj]',
+      ])
     );
   });
 
@@ -697,7 +707,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
 
     const test = fakeTest({
       title: 'a',
-      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
       location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
     });
     reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
@@ -723,7 +733,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
         budget_ratio_for_unhealthy_tests: 0.5,
         existing_test_names: [],
         existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['tests/sample.spec.ts > a'],
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
         max_test_execution_count: 5,
         max_test_name_length: 200,
         min_budget_duration_ms: 1_000,
@@ -733,7 +743,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
 
     const test = fakeTest({
       title: 'a',
-      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
       location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
     });
 
