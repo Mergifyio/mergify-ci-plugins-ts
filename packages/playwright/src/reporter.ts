@@ -32,8 +32,10 @@ import * as playwrightResource from './resources/playwright.js';
 import { readStateFile } from './state-file.js';
 import type { MergifyReporterOptions } from './types.js';
 import {
+  buildTestFunction,
   buildTestKey,
   extractNamespace,
+  formatTestListLine,
   mapStatus,
   projectNameFromTest,
   toPosix,
@@ -64,12 +66,23 @@ export class MergifyReporter implements Reporter {
   /** Buffer of (testCaseResult, key) pairs awaiting span emission. */
   private buffered: Array<{ result: TestCaseResult; key: string }> = [];
   /**
-   * Phase-1 outcomes for candidates that ran, deduplicated per key (so a
-   * multi-project suite contributes one entry per logical test, with failures
-   * preserved). Replayed into `flakyDetector.recordOutcome` at the start of
-   * onEnd, before phase-2 outcomes are merged in.
+   * Phase-1 outcomes for candidates that ran, one entry per logical
+   * `(test, project)` — the key includes the project via `buildTestKey`'s
+   * ` [project]` suffix, so multi-project runs naturally produce distinct
+   * entries. Replayed into `flakyDetector.recordOutcome` at the start of
+   * onEnd, before phase-2 outcomes are merged in. The project is kept
+   * alongside so phase-2 can scope each rerun via a `[project] > bareKey`
+   * line in the Playwright `--test-list` file.
+   *
+   * Same-key writes that DO occur (Playwright's `repeatEach > 1` issues the
+   * same test multiple times with identical titlePath) preserve the first
+   * recorded failure: dropping the fail in favour of a later pass would seed
+   * the detector with the wrong status and miss flaky-on-first-attempt tests.
    */
-  private phase1Outcomes: Map<string, { status: 'pass' | 'fail'; duration: number }> = new Map();
+  private phase1Outcomes: Map<
+    string,
+    { status: 'pass' | 'fail'; duration: number; project: string | undefined }
+  > = new Map();
 
   constructor(options?: MergifyReporterOptions) {
     this.options = options ?? {};
@@ -83,10 +96,14 @@ export class MergifyReporter implements Reporter {
     this.config = config;
 
     // Subprocess "rerun mode" — short-circuits the entire pipeline. The
-    // parent reporter set `MERGIFY_RERUN_FILE` to the path of a JSONL file
-    // we append per-attempt outcomes to. No tracing, no quarantine summary,
-    // no span emission.
-    this.rerunFile = process.env.MERGIFY_RERUN_FILE;
+    // parent reporter sets `MERGIFY_RERUN_FILE` to a JSONL path AND
+    // `MERGIFY_INTERNAL_RERUN=1` as a sentinel. Both must be present;
+    // requiring the sentinel prevents a leaked `MERGIFY_RERUN_FILE` from
+    // a user shell or CI environment from silently truncating an arbitrary
+    // path and disabling tracing/quarantine for the entire run.
+    if (process.env.MERGIFY_INTERNAL_RERUN === '1') {
+      this.rerunFile = process.env.MERGIFY_RERUN_FILE;
+    }
     if (this.rerunFile) {
       mkdirSync(dirname(this.rerunFile), { recursive: true });
       // Initialise the file (truncate). Each subsequent onTestEnd appends.
@@ -201,7 +218,12 @@ export class MergifyReporter implements Reporter {
     const testCaseResult: TestCaseResult = {
       filepath,
       absoluteFilepath,
-      function: test.title,
+      // The function field is decorated with the project so the emitted span
+      // name (`namespace > function`) matches `key` byte-for-byte. The
+      // backend stores this string as `test_name`; without the suffix it
+      // would collapse cross-project results back to a single record and
+      // recreate the false-absorption hazard buildTestKey fixes.
+      function: buildTestFunction(test.title, project),
       lineno: test.location?.line ?? 0,
       namespace,
       scope: 'case',
@@ -240,16 +262,22 @@ export class MergifyReporter implements Reporter {
     // — recording them as either pass or fail can produce misleading flaky
     // verdicts when phase 2 actually runs the test (rare but possible if
     // skip conditions differ across phases).
+    //
+    // Project is now part of the key, so multi-project suites no longer
+    // collide. The same key CAN still recur when the user's config sets
+    // `repeatEach > N` (Playwright clones each test, and the clone's
+    // titlePath is byte-identical to the original — see common/index.js
+    // `_clone`), so preserve the first failure: dropping it in favour of a
+    // later passing repeat seeds the detector with the wrong status and
+    // misses flaky-on-first-attempt tests.
     if (this.flakyDetector?.isCandidate(key) && result.status !== 'skipped') {
       const phase1Status: 'pass' | 'fail' = result.status === 'passed' ? 'pass' : 'fail';
       const existing = this.phase1Outcomes.get(key);
-      // In multi-project suites the same key appears once per project;
-      // preserve a failure if already recorded so cross-project flakiness
-      // is not masked by a later passing project.
       if (!existing || existing.status !== 'fail') {
         this.phase1Outcomes.set(key, {
           status: phase1Status,
           duration: result.duration,
+          project,
         });
       }
     }
@@ -282,11 +310,10 @@ export class MergifyReporter implements Reporter {
     this.session.status = reason;
 
     // Replay deduplicated phase-1 outcomes into the FlakyDetector so it sees
-    // exactly one initial attempt per candidate before any phase-2 outcomes
-    // are merged in. This mirrors the in-process Vitest pattern (one
-    // recordOutcome per attempt) — the only difference is that we batch the
-    // phase-1 recordings here instead of recording in onTestEnd, so that the
-    // multi-project dedup logic still applies.
+    // exactly one initial attempt per `(test, project)` candidate before any
+    // phase-2 outcomes are merged in. Mirrors the in-process Vitest pattern
+    // (one recordOutcome per attempt); we batch here so a `repeatEach > 1`
+    // run's same-key writes were preserved as one entry by phase1Outcomes.
     if (this.flakyDetector) {
       for (const [key, { status }] of this.phase1Outcomes) {
         this.flakyDetector.recordOutcome(key, status);
@@ -301,9 +328,12 @@ export class MergifyReporter implements Reporter {
     }
 
     // Augment buffered TestCaseResults with flakyDetection metadata before
-    // emitting spans. In multi-project suites the same key appears once per
-    // project — compute the verdict once and apply it to every matching entry,
-    // but only push to flakyResults once per unique key.
+    // emitting spans. With project baked into the key, multi-project runs
+    // produce one buffer entry per `(test, project)`; the user's
+    // `repeatEach > 1`, however, still buffers N entries with identical key
+    // (each repeat is a separate TestCase clone with the same titlePath), so
+    // we decorate every entry's tcr but push only one row per key into
+    // flakyResults to avoid inflating the summary.
     const processedFlakyKeys = new Set<string>();
     for (const { result: tcr, key } of this.buffered) {
       if (!this.flakyDetector?.isCandidate(key) || !this.flakyMode) continue;
@@ -356,11 +386,15 @@ export class MergifyReporter implements Reporter {
       }
     }
 
-    // Flaky detection summary
+    // Flaky detection summary. `Tests rerun` counts only candidates that
+    // actually had a phase-2 attempt — `flakyResults.length` includes
+    // candidates the phase-2 subprocess never reached (rerunCount === 0),
+    // which the user shouldn't see as "rerun".
     if (this.flakyMode) {
       process.stderr.write('[@mergifyio/playwright] Flaky detection report:\n');
       process.stderr.write(`  mode: ${this.flakyMode}\n`);
-      process.stderr.write(`  Tests rerun: ${this.flakyResults.length}\n`);
+      const rerun = this.flakyResults.filter((r) => r.rerunCount > 0);
+      process.stderr.write(`  Tests rerun: ${rerun.length}\n`);
 
       const flakyTests = this.flakyResults.filter((r) => r.flaky);
       process.stderr.write(`  Flaky tests detected: ${flakyTests.length}\n`);
@@ -391,9 +425,9 @@ export class MergifyReporter implements Reporter {
     // Compute repeat-each from the average phase-1 duration. Playwright
     // reports 0ms for very fast tests; we fall back to a 1ms floor so the
     // budget math doesn't divide by zero.
-    const durations = [...this.phase1Outcomes.values()].map((v) => v.duration);
-    const avgDuration =
-      durations.length > 0 ? durations.reduce((a, b) => a + b, 0) / durations.length : 0;
+    const entries = [...this.phase1Outcomes.entries()];
+    const durations = entries.map(([, { duration }]) => duration);
+    const avgDuration = durations.reduce((a, b) => a + b, 0) / durations.length;
     const effectiveDuration = Math.max(1, avgDuration);
     const repeatEach = flakyDetector.computeRepeatBudget(effectiveDuration);
     if (repeatEach < 1) return;
@@ -410,22 +444,33 @@ export class MergifyReporter implements Reporter {
     const runId = process.env.MERGIFY_TEST_RUN_ID ?? generateTestRunId();
     const suffix = `${runId}-${process.pid}-${randomBytes(4).toString('hex')}`;
     const rerunFile = join(tmpdir(), `mergify-rerun-${suffix}.jsonl`);
-    // `--test-list` takes a file with one test ID per line in `--list` format.
-    // Our `buildTestKey` output (`<filepath> > <suite> > <title>`) is exactly
-    // that format — Playwright accepts `>` and `›` interchangeably. This is
-    // exact-match (vs `--grep` which over-matches on leaf title across files).
+    // `--test-list` takes a file with one test ID per line in Playwright's
+    // `--list` format. We emit `[project] > <filepath> > <suite> > <title>`
+    // for project-scoped candidates and `<filepath> > <suite> > <title>` for
+    // the bare ones. ` > ` is the only delimiter — mixing `›` breaks
+    // Playwright's single-delimiter split (see `formatTestListLine`).
     const testListFile = join(tmpdir(), `mergify-tests-${suffix}.txt`);
-    writeFileSync(testListFile, `${[...this.phase1Outcomes.keys()].join('\n')}\n`);
+    const lines = entries.map(([key, { project }]) => formatTestListLine(key, project));
+    writeFileSync(testListFile, `${lines.join('\n')}\n`);
 
+    // Strip MERGIFY_STATE_FILE from the child env so the subprocess's auto
+    // quarantine fixture doesn't load it and absorb failing reruns into
+    // `expectedStatus` — that would suppress the very stack traces the user
+    // needs to debug the underlying flake. The parent reads result.status
+    // raw, so the verdict is unaffected, but the human-visible subprocess
+    // output must surface real failures.
+    const { MERGIFY_STATE_FILE: _stateFile, ...inheritedEnv } = process.env;
+    void _stateFile;
     const spawnEnv = {
-      ...process.env,
+      ...inheritedEnv,
       MERGIFY_RERUN_FILE: rerunFile,
+      MERGIFY_INTERNAL_RERUN: '1',
     };
 
     // --retries=0: phase-2 measures raw pass/fail per attempt; built-in
     // retries would mask underlying failures and inflate JSONL entries.
     const timeoutMs = Math.max(
-      effectiveDuration * (repeatEach + 1) * this.phase1Outcomes.size + 60_000,
+      effectiveDuration * (repeatEach + 1) * entries.length + 60_000,
       120_000
     );
     const child = spawnSync(
@@ -458,8 +503,7 @@ export class MergifyReporter implements Reporter {
     // Parse JSONL outcomes. We read the file regardless of how the
     // subprocess terminated — even a spawn failure (ENOBUFS, ENOENT) or a
     // crash mid-run may have left a partial set of valid lines that
-    // beats throwing the whole verdict away. A failure with NO output
-    // produced is the only case that warrants a stderr diagnostic.
+    // beats throwing the whole verdict away.
     let raw: string;
     try {
       raw = readFileSync(rerunFile, 'utf8');
@@ -467,7 +511,11 @@ export class MergifyReporter implements Reporter {
       raw = '';
     }
     const exitedAbnormally = child.error || (child.status !== null && child.status !== 0);
-    if (exitedAbnormally && raw.trim().length === 0) {
+    if (exitedAbnormally) {
+      // Always surface abnormal exits, even if a partial JSONL survived: a
+      // SIGTERM-from-timeout that wrote K of N outcomes silently feeds
+      // truncated data into the verdict and would otherwise leave no trace
+      // in the user's logs.
       const detail = [child.stdout, child.stderr]
         .filter((s) => s && s.trim().length > 0)
         .join('\n')
@@ -475,9 +523,10 @@ export class MergifyReporter implements Reporter {
       const reason = child.error
         ? `failed: ${String(child.error)}`
         : `exited with status ${child.status} (signal=${child.signal ?? 'none'})`;
+      const outcomeNote = raw.trim().length === 0 ? 'no outcomes' : 'partial outcomes only';
       process.stderr.write(
         `[@mergifyio/playwright] flaky-detection rerun subprocess ${reason}` +
-          ` and produced no outcomes${detail ? `:\n${detail}` : ''}\n`
+          ` (${outcomeNote})${detail ? `:\n${detail}` : ''}\n`
       );
     }
     for (const line of raw.split('\n')) {
@@ -489,8 +538,14 @@ export class MergifyReporter implements Reporter {
         };
         if (typeof parsed.key !== 'string' || typeof parsed.status !== 'string') continue;
         // Skipped attempts don't contribute to the flaky verdict — drop them.
+        // Every other non-pass (failed, timedOut, interrupted) is recorded
+        // as 'fail' to mirror phase-1's mapStatus convention; without this
+        // a test that times out in every phase-2 attempt would have its
+        // timeouts silently dropped and a phase-1 fail + zero phase-2
+        // outcomes would emit isFlaky=false instead of "consistently broken".
+        if (parsed.status === 'skipped') continue;
         if (parsed.status === 'passed') flakyDetector.recordOutcome(parsed.key, 'pass');
-        else if (parsed.status === 'failed') flakyDetector.recordOutcome(parsed.key, 'fail');
+        else flakyDetector.recordOutcome(parsed.key, 'fail');
       } catch {
         // skip malformed line
       }

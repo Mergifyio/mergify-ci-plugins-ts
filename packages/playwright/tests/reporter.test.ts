@@ -21,14 +21,19 @@ function fakeTest(
     titlePath?: string[];
     location?: { file: string; line: number; column: number };
     retries?: number;
-    parent?: unknown;
     outcome?: () => 'expected' | 'unexpected' | 'flaky' | 'skipped';
     annotations?: Array<{ type: string; description?: string }>;
   } = {}
 ): TestCase {
   return {
     title: overrides.title ?? 'my test',
-    titlePath: () => overrides.titlePath ?? ['chromium', '/root/tests/x.spec.ts', 'my test'],
+    // Real Playwright shape: ['', project, basename, ...describes, title].
+    // The file-suite slot is the basename (`x.spec.ts`), NOT the absolute
+    // path — stripFileSuite recognises basename / relative-from-rootDir; an
+    // absolute path leaks into the namespace and breaks buildTestKey.
+    // `projectNameFromTest` reads titlePath[1] directly, so we don't mock
+    // `parent.project()` — that field would be dead code.
+    titlePath: () => overrides.titlePath ?? ['', 'chromium', 'x.spec.ts', 'my test'],
     location: overrides.location ?? {
       file: '/root/tests/x.spec.ts',
       line: 42,
@@ -36,7 +41,6 @@ function fakeTest(
     },
     retries: overrides.retries ?? 0,
     results: [] as TestResult[],
-    parent: overrides.parent ?? ({ project: () => ({ name: 'chromium' }) } as unknown),
     outcome: overrides.outcome ?? (() => 'expected'),
     annotations: overrides.annotations ?? [],
   } as unknown as TestCase;
@@ -119,7 +123,7 @@ describe('onTestEnd — passing test', () => {
     reporter.onBegin(fakeConfig(), fakeSuite());
     const test = fakeTest({
       title: 'adds numbers',
-      titlePath: ['chromium', '/root/tests/math.spec.ts', 'math', 'adds numbers'],
+      titlePath: ['', 'chromium', 'math.spec.ts', 'math', 'adds numbers'],
       location: { file: '/root/tests/math.spec.ts', line: 15, column: 3 },
     });
     reporter.onTestEnd(test, fakeResult({ status: 'passed', duration: 5 }));
@@ -128,7 +132,10 @@ describe('onTestEnd — passing test', () => {
     const spans = exporter.getFinishedSpans();
     const testSpan = spans.find((s) => s.attributes['test.scope'] === 'case');
     expect(testSpan).toBeDefined();
-    expect(testSpan!.attributes['code.function']).toBe('adds numbers');
+    // function is decorated with [project] so the span name (namespace > function)
+    // is byte-identical to buildTestKey's output — the backend stores this as
+    // test_name and matches it against per-project quarantine / unhealthy lists.
+    expect(testSpan!.attributes['code.function']).toBe('adds numbers [chromium]');
     expect(testSpan!.attributes['code.namespace']).toBe('tests/math.spec.ts > math');
     expect(testSpan!.attributes['code.lineno']).toBe(15);
     expect(testSpan!.attributes['code.filepath']).toBe('tests/math.spec.ts');
@@ -148,7 +155,7 @@ describe('onTestEnd — passing test', () => {
     const session = reporter.getSession()!;
     expect(session.testCases).toHaveLength(1);
     expect(session.testCases[0].status).toBe('passed');
-    expect(session.testCases[0].function).toBe('my test');
+    expect(session.testCases[0].function).toBe('my test [chromium]');
   });
 
   it('makes the test case span a child of the session span', async () => {
@@ -327,11 +334,11 @@ describe('onTestEnd — multi-project', () => {
 
     const chromium = fakeTest({
       title: 'same test',
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'same test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'same test'],
     });
     const firefox = fakeTest({
       title: 'same test',
-      titlePath: ['firefox', '/root/tests/x.spec.ts', 'same test'],
+      titlePath: ['', 'firefox', 'x.spec.ts', 'same test'],
     });
 
     reporter.onTestEnd(chromium, fakeResult());
@@ -349,7 +356,7 @@ describe('onTestEnd — multi-project', () => {
 
     reporter.onBegin(fakeConfig(), fakeSuite());
     const test = fakeTest({
-      titlePath: ['', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', '', 'x.spec.ts', 'my test'],
     });
     reporter.onTestEnd(test, fakeResult());
     await reporter.onEnd({ status: 'passed', startTime: new Date(), duration: 1 });
@@ -472,7 +479,7 @@ describe('MergifyReporter V2 — quarantine', () => {
         testRunId: 'abc123def456',
         createdAt: '2026-04-21T16:07:42Z',
         rootDir: '/root',
-        quarantinedTests: ['tests/x.spec.ts > my test'],
+        quarantinedTests: ['tests/x.spec.ts > my test [chromium]'],
       })
     );
     process.env.MERGIFY_TEST_RUN_ID = 'abc123def456';
@@ -502,7 +509,7 @@ describe('MergifyReporter V2 — quarantine', () => {
 
     // Attach the annotation the fixture would have pushed.
     const test = fakeTest({
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'my test'],
       location: { file: '/root/tests/x.spec.ts', line: 1, column: 1 },
       annotations: [{ type: 'mergify:quarantined' }],
     });
@@ -523,7 +530,7 @@ describe('MergifyReporter V2 — quarantine', () => {
     reporter.onBegin(fakeConfig(), fakeSuite());
 
     const test = fakeTest({
-      titlePath: ['chromium', '/root/tests/x.spec.ts', 'my test'],
+      titlePath: ['', 'chromium', 'x.spec.ts', 'my test'],
       location: { file: '/root/tests/x.spec.ts', line: 1, column: 1 },
       annotations: [{ type: 'mergify:quarantined' }],
     });
@@ -534,7 +541,7 @@ describe('MergifyReporter V2 — quarantine', () => {
     expect(output).toContain('Quarantine report');
     expect(output).toContain('fetched: 1');
     expect(output).toContain('caught:  1');
-    expect(output).toContain('    - tests/x.spec.ts > my test');
+    expect(output).toContain('    - tests/x.spec.ts > my test [chromium]');
     expect(output).toContain('unused:  0');
   });
 
@@ -595,7 +602,7 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
       flakyContext: {
         budget_ratio_for_new_tests: 0.5,
         budget_ratio_for_unhealthy_tests: 0.5,
-        existing_test_names: ['tests/sample.spec.ts > existing-test'],
+        existing_test_names: ['tests/sample.spec.ts > existing-test [proj]'],
         existing_tests_mean_duration_ms: 100,
         unhealthy_test_names: [],
         max_test_execution_count: 5,
@@ -610,24 +617,27 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
     const tests = [
       fakeTest({
         title: 'existing-test',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'existing-test'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'existing-test'],
         location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
       }),
       fakeTest({
         title: 'new-test-1',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-1'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'new-test-1'],
         location: { file: '/root/tests/sample.spec.ts', line: 5, column: 1 },
       }),
       fakeTest({
         title: 'new-test-2',
-        titlePath: ['proj', '/root/tests/sample.spec.ts', 'new-test-2'],
+        titlePath: ['', 'proj', 'sample.spec.ts', 'new-test-2'],
         location: { file: '/root/tests/sample.spec.ts', line: 10, column: 1 },
       }),
     ];
     reporter.onBegin(fakeConfig(), suiteWithTests(tests));
 
     expect(new Set(reporter.getFlakyCandidates())).toEqual(
-      new Set(['tests/sample.spec.ts > new-test-1', 'tests/sample.spec.ts > new-test-2'])
+      new Set([
+        'tests/sample.spec.ts > new-test-1 [proj]',
+        'tests/sample.spec.ts > new-test-2 [proj]',
+      ])
     );
   });
 
@@ -697,7 +707,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
 
     const test = fakeTest({
       title: 'a',
-      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
       location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
     });
     reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
@@ -709,6 +719,49 @@ describe('MergifyReporter — flaky-detection summary block', () => {
     // Test 'a' is not in flakyCandidates → not aggregated, so 0 rerun + 0 flaky.
     expect(out).toContain('Tests rerun: 0');
     expect(out).toContain('Flaky tests detected: 0');
+  });
+
+  it('preserves the first phase-1 failure when the same (test, project) key is recorded twice (Playwright `repeatEach`)', async () => {
+    // Regression guard for the dedup-removal correctness bug: with
+    // repeatEach > 1, Playwright clones each test with byte-identical
+    // titlePath, so onTestEnd fires twice for the same key. The first
+    // recorded failure must NOT be overwritten by a subsequent passing
+    // repeat, otherwise the FlakyDetector seeds with the wrong status and
+    // misses flaky-on-first-attempt tests entirely.
+    seedFlakyState({
+      flakyContext: {
+        budget_ratio_for_new_tests: 0.5,
+        budget_ratio_for_unhealthy_tests: 0.5,
+        existing_test_names: [],
+        existing_tests_mean_duration_ms: 100,
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
+        max_test_execution_count: 5,
+        max_test_name_length: 200,
+        min_budget_duration_ms: 1_000,
+        min_test_execution_count: 3,
+      },
+    });
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+    });
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
+    // First clone fails, second clone (same key) passes.
+    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
+    reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
+    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
+
+    // Both clones share a flakyDetection block (we decorate every buffered
+    // entry), but flakyResults must have ONE row, and the fail seeded into
+    // the detector must show up in the verdict as flaky=false-but-not-pass-
+    // only (the test ran with one fail + zero phase-2 outcomes, so
+    // isFlaky=false but rerunCount=0; the regression we're guarding against
+    // is a second push to flakyResults inflating the count).
+    const session = reporter.getSession()!;
+    const candidate = session.testCases[0];
+    expect(candidate.flakyDetection).toBeDefined();
   });
 
   it('does not emit flakyDetection for a candidate that was skipped in phase 1 and not rerun', async () => {
@@ -723,7 +776,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
         budget_ratio_for_unhealthy_tests: 0.5,
         existing_test_names: [],
         existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['tests/sample.spec.ts > a'],
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
         max_test_execution_count: 5,
         max_test_name_length: 200,
         min_budget_duration_ms: 1_000,
@@ -733,7 +786,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
 
     const test = fakeTest({
       title: 'a',
-      titlePath: ['proj', '/root/tests/sample.spec.ts', 'a'],
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
       location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
     });
 

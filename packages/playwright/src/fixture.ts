@@ -1,7 +1,7 @@
 import { relative } from 'node:path';
 import { test as baseTest, expect, type TestInfo } from '@playwright/test';
 import { readStateFile } from './state-file.js';
-import { buildTestKey, toPosix } from './utils.js';
+import { buildTestKeyFromInfo, toPosix } from './utils.js';
 
 interface ApplyArgs {
   testInfo: TestInfo;
@@ -17,7 +17,12 @@ export function applyQuarantine({ testInfo, quarantineSet, rootDir }: ApplyArgs)
   if (status === undefined || !FAILED_STATUSES.has(status)) return;
 
   const filepath = toPosix(relative(rootDir, testInfo.file));
-  const key = buildTestKey(filepath, testInfo.titlePath, testInfo.title);
+  const key = buildTestKeyFromInfo(
+    filepath,
+    testInfo.titlePath,
+    testInfo.project.name,
+    testInfo.title
+  );
   if (!quarantineSet.has(key)) return;
 
   // Mirror the actual status. Playwright reconciles a test as "expected" only
