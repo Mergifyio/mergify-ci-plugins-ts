@@ -7,6 +7,7 @@ interface MockInfo {
   title: string;
   titlePath: string[];
   file: string;
+  project: { name: string };
   status: Status;
   // Mirrors Playwright's TestInfo.expectedStatus enum (test.d.ts:2494) — the
   // fixture sets it to a non-default value (e.g. 'timedOut') under quarantine,
@@ -18,8 +19,13 @@ interface MockInfo {
 function mockInfo(overrides: Partial<MockInfo> = {}): MockInfo {
   return {
     title: 'adds numbers',
-    titlePath: ['chromium', '/repo/tests/math.spec.ts', 'math', 'adds numbers'],
+    // Real worker-side TestInfo.titlePath shape: [file, ...describes, title].
+    // The runner-side TestCase.titlePath() prepends `['', project]` but the
+    // worker's parent chain does not include the root/project suites — that
+    // info lives on testInfo.project instead.
+    titlePath: ['math.spec.ts', 'math', 'adds numbers'],
     file: '/repo/tests/math.spec.ts',
+    project: { name: 'chromium' },
     status: 'passed',
     expectedStatus: 'passed',
     annotations: [],
@@ -28,7 +34,10 @@ function mockInfo(overrides: Partial<MockInfo> = {}): MockInfo {
 }
 
 describe('applyQuarantine', () => {
-  const quarantineSet = new Set(['tests/math.spec.ts > math > adds numbers']);
+  // Quarantine entries arriving from the backend carry the same
+  // `[project] >` prefix `buildTestKey` produces — they're the same string
+  // the span name is built from.
+  const quarantineSet = new Set(['[chromium] > tests/math.spec.ts > math > adds numbers']);
 
   it('mutates expectedStatus and pushes annotation when quarantined + failed', () => {
     const info = mockInfo({ status: 'failed' });
@@ -48,8 +57,18 @@ describe('applyQuarantine', () => {
     const info = mockInfo({
       status: 'failed',
       title: 'other',
-      titlePath: ['chromium', '/repo/tests/math.spec.ts', 'math', 'other'],
+      titlePath: ['math.spec.ts', 'math', 'other'],
     });
+    applyQuarantine({ testInfo: info as never, quarantineSet, rootDir: '/repo' });
+    expect(info.expectedStatus).toBe('passed');
+    expect(info.annotations).toEqual([]);
+  });
+
+  it('does not absorb when the project name does not match the quarantine entry', () => {
+    // Same logical test, different project — the per-(test, project) key
+    // means a `[chromium]` quarantine entry must NOT match a `[firefox]`
+    // failure, preserving the cross-browser visibility we want.
+    const info = mockInfo({ status: 'failed', project: { name: 'firefox' } });
     applyQuarantine({ testInfo: info as never, quarantineSet, rootDir: '/repo' });
     expect(info.expectedStatus).toBe('passed');
     expect(info.annotations).toEqual([]);
