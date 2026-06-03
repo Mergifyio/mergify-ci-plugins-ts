@@ -32,10 +32,10 @@ import * as playwrightResource from './resources/playwright.js';
 import { readStateFile } from './state-file.js';
 import type { MergifyReporterOptions } from './types.js';
 import {
+  buildTestFunction,
   buildTestKey,
-  buildTestKeyParts,
   extractNamespace,
-  isTestListSafe,
+  formatTestListLine,
   mapStatus,
   projectNameFromTest,
   toPosix,
@@ -67,24 +67,21 @@ export class MergifyReporter implements Reporter {
   private buffered: Array<{ result: TestCaseResult; key: string }> = [];
   /**
    * Phase-1 outcomes for candidates that ran, one entry per logical
-   * `(test, project)` — the key is `buildTestKey`'s `[project] > file > …`
-   * prefix form, so multi-project runs naturally produce distinct keys
-   * with no extra dedup. The key is also Playwright's `--test-list` wire
-   * format byte-for-byte, so phase-2 writes each key straight into the
-   * subprocess's test-list file. `testListSafe` flags whether the
-   * candidate's segments survive Playwright's loader; a single unsafe
-   * segment aborts the entire subprocess, so unsafe ones are reported and
-   * skipped (see `runFlakyDetectionPhase2`).
+   * `(test, project)` — the key includes the project via `buildTestKey`'s
+   * ` [project]` suffix, so multi-project runs naturally produce distinct
+   * entries. Replayed into `flakyDetector.recordOutcome` at the start of
+   * onEnd, before phase-2 outcomes are merged in. The project is kept
+   * alongside so phase-2 can scope each rerun via a `[project] > bareKey`
+   * line in the Playwright `--test-list` file.
    *
-   * Same-key writes that DO occur (Playwright's `repeatEach > 1` issues
-   * the same test multiple times with identical titlePath) preserve the
-   * first recorded failure: dropping the fail in favour of a later pass
-   * would seed the detector with the wrong status and miss
-   * flaky-on-first-attempt tests.
+   * Same-key writes that DO occur (Playwright's `repeatEach > 1` issues the
+   * same test multiple times with identical titlePath) preserve the first
+   * recorded failure: dropping the fail in favour of a later pass would seed
+   * the detector with the wrong status and miss flaky-on-first-attempt tests.
    */
   private phase1Outcomes: Map<
     string,
-    { status: 'pass' | 'fail'; duration: number; testListSafe: boolean }
+    { status: 'pass' | 'fail'; duration: number; project: string | undefined }
   > = new Map();
 
   constructor(options?: MergifyReporterOptions) {
@@ -221,13 +218,12 @@ export class MergifyReporter implements Reporter {
     const testCaseResult: TestCaseResult = {
       filepath,
       absoluteFilepath,
-      // `function` stays as the bare test title; the project qualifier is
-      // carried by `namespace` (which `extractNamespace` prepends with
-      // `[project] >`), so the emitted span name `${namespace} > ${function}`
-      // comes out as `[project] > file > describes > title` — Playwright's
-      // own display / `--test-list` format — and is byte-identical to the
-      // key the backend matches against quarantine / unhealthy lists.
-      function: test.title,
+      // The function field is decorated with the project so the emitted span
+      // name (`namespace > function`) matches `key` byte-for-byte. The
+      // backend stores this string as `test_name`; without the suffix it
+      // would collapse cross-project results back to a single record and
+      // recreate the false-absorption hazard buildTestKey fixes.
+      function: buildTestFunction(test.title, project),
       lineno: test.location?.line ?? 0,
       namespace,
       scope: 'case',
@@ -278,20 +274,10 @@ export class MergifyReporter implements Reporter {
       const phase1Status: 'pass' | 'fail' = result.status === 'passed' ? 'pass' : 'fail';
       const existing = this.phase1Outcomes.get(key);
       if (!existing || existing.status !== 'fail') {
-        // Per-segment safety check for phase-2 `--test-list` round-trip:
-        // Playwright's loader splits each line on `>` / `›` and parses an
-        // optional `[project]` prefix, so any `>`, `›`, `[`, `]`, or newline
-        // in a segment (filepath, describe, title, or project name) will
-        // make a single line throw "Malformed test description" and abort
-        // the entire subprocess. We can't check the assembled key because
-        // its `[project]` prefix would itself fail the bracket test.
-        const parts = buildTestKeyParts(filepath, titlePath, test.title);
-        const testListSafe =
-          parts.every(isTestListSafe) && (project === undefined || isTestListSafe(project));
         this.phase1Outcomes.set(key, {
           status: phase1Status,
           duration: result.duration,
-          testListSafe,
+          project,
         });
       }
     }
@@ -436,37 +422,11 @@ export class MergifyReporter implements Reporter {
   private async runFlakyDetectionPhase2(flakyDetector: FlakyDetector): Promise<void> {
     if (this.phase1Outcomes.size === 0) return;
 
-    // Drop candidates whose segments (project, file, describes, title)
-    // contain characters Playwright's `loadTestList` cannot disambiguate
-    // (`[ ] > ›  \n`). Without this guard a single unrepresentable name
-    // throws "Malformed test description" inside the subprocess's
-    // lines.map and aborts the entire phase-2 run, collapsing every flake
-    // verdict to false. The per-candidate `testListSafe` flag was computed
-    // at insertion time when the parts were still available; here we
-    // partition and report.
-    const allEntries = [...this.phase1Outcomes.entries()];
-    const safeEntries: typeof allEntries = [];
-    const unsafe: string[] = [];
-    for (const entry of allEntries) {
-      if (entry[1].testListSafe) safeEntries.push(entry);
-      else unsafe.push(entry[0]);
-    }
-    if (unsafe.length > 0) {
-      process.stderr.write(
-        `[@mergifyio/playwright] skipping ${unsafe.length} flaky-detection candidate(s) ` +
-          'whose project name, file path, or test name contains `[`, `]`, `>`, `›`, or a ' +
-          'newline — Playwright `--test-list` cannot disambiguate them:\n'
-      );
-      for (const k of unsafe) {
-        process.stderr.write(`    - ${k}\n`);
-      }
-    }
-    if (safeEntries.length === 0) return;
-
     // Compute repeat-each from the average phase-1 duration. Playwright
     // reports 0ms for very fast tests; we fall back to a 1ms floor so the
     // budget math doesn't divide by zero.
-    const durations = safeEntries.map(([, { duration }]) => duration);
+    const entries = [...this.phase1Outcomes.entries()];
+    const durations = entries.map(([, { duration }]) => duration);
     const avgDuration = durations.reduce((a, b) => a + b, 0) / durations.length;
     const effectiveDuration = Math.max(1, avgDuration);
     const repeatEach = flakyDetector.computeRepeatBudget(effectiveDuration);
@@ -485,12 +445,12 @@ export class MergifyReporter implements Reporter {
     const suffix = `${runId}-${process.pid}-${randomBytes(4).toString('hex')}`;
     const rerunFile = join(tmpdir(), `mergify-rerun-${suffix}.jsonl`);
     // `--test-list` takes a file with one test ID per line in Playwright's
-    // `--list` format: `[project] > file > describes > title`, or
-    // `file > describes > title` for bare/unnamed-project candidates. Each
-    // candidate's key is already in that exact format (see `buildTestKey`),
-    // so we just write the keys verbatim — no strip-and-reformat needed.
+    // `--list` format. We emit `[project] > <filepath> > <suite> > <title>`
+    // for project-scoped candidates and `<filepath> > <suite> > <title>` for
+    // the bare ones. ` > ` is the only delimiter — mixing `›` breaks
+    // Playwright's single-delimiter split (see `formatTestListLine`).
     const testListFile = join(tmpdir(), `mergify-tests-${suffix}.txt`);
-    const lines = safeEntries.map(([key]) => key);
+    const lines = entries.map(([key, { project }]) => formatTestListLine(key, project));
     writeFileSync(testListFile, `${lines.join('\n')}\n`);
 
     // Strip MERGIFY_STATE_FILE from the child env so the subprocess's auto
@@ -510,7 +470,7 @@ export class MergifyReporter implements Reporter {
     // --retries=0: phase-2 measures raw pass/fail per attempt; built-in
     // retries would mask underlying failures and inflate JSONL entries.
     const timeoutMs = Math.max(
-      effectiveDuration * (repeatEach + 1) * safeEntries.length + 60_000,
+      effectiveDuration * (repeatEach + 1) * entries.length + 60_000,
       120_000
     );
     const child = spawnSync(

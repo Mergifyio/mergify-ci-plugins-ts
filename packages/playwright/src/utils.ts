@@ -13,27 +13,21 @@ export function toPosix(p: string): string {
 }
 
 /**
- * Build the namespace for a Playwright test — the qualifier portion of the
- * emitted span name, NOT counting the test's own title.
- *
+ * Build the namespace for a Playwright test as `<filepath> > <describes>`.
  * `titlePath()` is `['', projectName, filePath, ...describes, testTitle]`
- * (Playwright places an empty root-suite name at index 0). We assemble
- * `[project] > <filepath> > <describes>` so the eventual span name (
- * `${namespace} > ${function}`, computed by `emitTestCaseSpan` in
- * `@mergifyio/ci-core`) reads
+ * (Playwright places an empty root-suite name at index 0); we take the
+ * describe segments and prepend the caller-normalized filepath so the
+ * resulting span name is filepath-qualified, matching the vitest convention
+ * (avoiding collisions when two files share a describe+test name).
  *
- *   [project] > file > describes > title
- *
- * — Playwright's own display and `--test-list` wire format. The `[project] >`
- * prefix is omitted when the project is empty/unnamed so single-project
- * repos keep the file-first shape.
+ * The project name is intentionally NOT part of the namespace — it is appended
+ * to the test title via `buildTestKey` / `buildTestFunction` instead, so the
+ * span name reads `<file> > <describes> > <title> [project]`.
  */
 export function extractNamespace(filepath: string, titlePath: readonly string[]): string {
-  const project = titlePath[1] ?? '';
   const describes = stripFileSuite(titlePath.slice(2, -1), filepath);
-  const segments =
-    project.length > 0 ? [`[${project}]`, filepath, ...describes] : [filepath, ...describes];
-  return segments.filter((p) => p.length > 0).join(' > ');
+  const parts = [filepath, ...describes].filter((p) => p.length > 0);
+  return parts.join(' > ');
 }
 
 /**
@@ -53,23 +47,32 @@ export function stripFileSuite(describes: readonly string[], filepath: string): 
 }
 
 /**
+ * Decorate a test title with its project name. Used for both `buildTestKey`
+ * (matching against backend quarantine / flaky-detection lists) and for the
+ * emitted span's `function` field, so the span name ends with `[project]` too.
+ * Returns the bare title when project is empty/undefined — single-project
+ * suites keep the old key shape and stay backward-compatible.
+ */
+export function buildTestFunction(title: string, project: string | undefined): string {
+  return project && project.length > 0 ? `${title} [${project}]` : title;
+}
+
+/**
  * Shared inner of `buildTestKey` and `buildTestKeyFromInfo`. Strips the file
- * suite from the raw describes, prepends `[project] >` when project is
- * non-empty, and joins with ` > ` (dropping empty segments so the
- * namespace-empty case still produces a clean key).
+ * suite from the raw describes, decorates the title with `[project]`, and
+ * joins with ` > ` (dropping empty segments so the namespace-empty case still
+ * produces a clean key).
  */
 function assembleKey(
   filepath: string,
   rawDescribes: readonly string[],
-  project: string,
+  project: string | undefined,
   title: string
 ): string {
   const describes = stripFileSuite(rawDescribes, filepath);
-  const segments =
-    project.length > 0
-      ? [`[${project}]`, filepath, ...describes, title]
-      : [filepath, ...describes, title];
-  return segments.filter((p) => p.length > 0).join(' > ');
+  const decoratedTitle = buildTestFunction(title, project);
+  const parts = [filepath, ...describes, decoratedTitle].filter((p) => p.length > 0);
+  return parts.join(' > ');
 }
 
 /**
@@ -78,21 +81,17 @@ function assembleKey(
  * both for quarantine list matching and for flaky-detection candidate
  * matching.
  *
- * Includes the project as a `[project] >` prefix so that the same test
- * running in two projects (e.g. `chromium` + `firefox`) is identified as
- * two distinct tests — the backend stores per-project entries, quarantine
- * / unhealthy lists from the API arrive per-project, and a Firefox-only
- * flake never absorbs a Chrome regression. The shape matches Playwright's
- * own reporter and `--test-list` format byte-for-byte, so the key can flow
- * straight into the phase-2 rerun subprocess with no reformatting.
+ * Includes the project as a ` [project]` suffix so that the same test running
+ * in two projects (e.g. `chromium` + `firefox`) is identified as two distinct
+ * tests — the backend stores per-project entries, quarantine / unhealthy
+ * lists from the API arrive per-project, and a Firefox-only flake never
+ * absorbs a Chrome regression.
  *
- * Must match the span name produced by `emitTestCaseSpan` in
- * @mergifyio/ci-core:
+ * Must match the span name produced by `emitTestCaseSpan` in @mergifyio/ci-core:
  *   namespace > function  (when namespace is non-empty)
  *   function              (when namespace is empty)
- * where `namespace` is `extractNamespace(filepath, titlePath)` and contains
- * the `[project] >` prefix when applicable, so the assembled span name
- * comes out as `[project] > file > describes > title`.
+ * where `namespace` is `extractNamespace(filepath, titlePath)` and the function
+ * is decorated with `[project]` via `buildTestFunction`.
  */
 export function buildTestKey(
   filepath: string,
@@ -112,7 +111,7 @@ export function buildTestKey(
  * NOT interchangeable, even though both feed into the same key string.
  *
  * Used by the quarantine fixture, which only has access to a `TestInfo` and
- * reads the project from `testInfo.project.name`.
+ * computes the project from `testInfo.project.name`.
  */
 export function buildTestKeyFromInfo(
   filepath: string,
@@ -124,48 +123,40 @@ export function buildTestKeyFromInfo(
 }
 
 /**
- * Return the individual segments (filepath, ...describes, title) that
- * `buildTestKey` assembles into the key body, AFTER the file-suite dedup
- * but BEFORE the project prefix is prepended and BEFORE empty filtering.
- * Each segment must independently satisfy `isTestListSafe` for the
- * candidate to survive phase-2 `--test-list` round-tripping. The project
- * itself is checked separately by the caller because it's stored as a
- * sibling field, not part of the title path.
- */
-export function buildTestKeyParts(
-  filepath: string,
-  titlePath: readonly string[],
-  title: string
-): readonly string[] {
-  const describes = stripFileSuite(titlePath.slice(2, -1), filepath);
-  return [filepath, ...describes, title];
-}
-
-/**
- * Characters that Playwright's `loadTestList` cannot disambiguate in a
- * single segment:
- *  - `>` and `›` are both accepted as the segment separator; either inside
- *    a segment confuses the single-delimiter split.
- *  - `[` / `]` collide with the optional `[project]` prefix parser.
- *  - `\n` splits a single test description into two malformed lines.
+ * Convert a key produced by `buildTestKey` into a single `--test-list` line
+ * that Playwright's loader can parse.
  *
- * Any candidate carrying one of these in its project name, file path,
- * describe segments, or title cannot be safely scoped via `--test-list`.
- * The check is per-segment — the assembled key legitimately contains
- * `[project]`-shaped brackets at its head, so the predicate must NOT be
- * applied to the full key string.
+ * Playwright's loader reads project scoping from a leading `[project]` token
+ * (see `loadTestList` in `playwright/lib/runner/index.js`), and matches the
+ * remaining `file > describes > title` against `test.titlePath()`. Because we
+ * append `[project]` to the END of the key (so it appears in span names and
+ * the backend's test_name), we strip the suffix before writing the line.
+ *
+ * The whole line uses ` > ` as the separator throughout. Playwright accepts
+ * `>` and `›` interchangeably but picks ONE per line (the first that appears)
+ * and splits the entire line on it; mixing the two — `[project] › body > with
+ * > separators` — makes the loader split on `›`, treat the body as one token,
+ * and fail to match.
+ *
+ * No escaping: a `>` / `›` / `[` / `]` / `\n` in any segment (project, file,
+ * describes, or title) can either crash the loader (project name with `>` /
+ * `]`-not-at-end) or silently fail the candidate's match. The crash case
+ * surfaces via the subprocess's stderr through the abnormal-exit diagnostic
+ * in `runFlakyDetectionPhase2`.
  */
-const TEST_LIST_UNSAFE = /[[\]>\n]|›/u;
-
-/**
- * Return true when the string can flow through Playwright's `--test-list`
- * loader (`loadTestList` in `playwright/lib/runner/index.js`) as a single
- * segment without mis-parsing. Used to filter phase-2 candidates so a
- * single unrepresentable name (or project name, or file path containing
- * `[`) can't crash the whole subprocess.
- */
-export function isTestListSafe(s: string): boolean {
-  return !TEST_LIST_UNSAFE.test(s);
+export function formatTestListLine(key: string, project: string | undefined): string {
+  if (!project || project.length === 0) return key;
+  const suffix = ` [${project}]`;
+  // Callers always pair a key with the project that built it, so the suffix
+  // is present by construction. If a future caller breaks that invariant we
+  // want to know rather than silently produce a line Playwright would parse
+  // as a different test.
+  if (!key.endsWith(suffix)) {
+    throw new Error(
+      `formatTestListLine: key ${JSON.stringify(key)} does not end with project suffix ${JSON.stringify(suffix)}`
+    );
+  }
+  return `[${project}] > ${key.slice(0, -suffix.length)}`;
 }
 
 /**

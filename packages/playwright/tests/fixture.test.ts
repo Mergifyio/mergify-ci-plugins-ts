@@ -34,10 +34,10 @@ function mockInfo(overrides: Partial<MockInfo> = {}): MockInfo {
 }
 
 describe('applyQuarantine', () => {
-  // Quarantine entries arriving from the backend carry the same
-  // `[project] >` prefix `buildTestKey` produces — they're the same string
-  // the span name is built from.
-  const quarantineSet = new Set(['[chromium] > tests/math.spec.ts > math > adds numbers']);
+  // Quarantine entries arriving from the backend carry the same ` [project]`
+  // suffix `buildTestKey` produces — they're the same string the span name
+  // is built from.
+  const quarantineSet = new Set(['tests/math.spec.ts > math > adds numbers [chromium]']);
 
   it('mutates expectedStatus and pushes annotation when quarantined + failed', () => {
     const info = mockInfo({ status: 'failed' });

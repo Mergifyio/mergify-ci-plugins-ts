@@ -132,12 +132,11 @@ describe('onTestEnd — passing test', () => {
     const spans = exporter.getFinishedSpans();
     const testSpan = spans.find((s) => s.attributes['test.scope'] === 'case');
     expect(testSpan).toBeDefined();
-    // `code.function` is the bare title; the project prefix lives on
-    // `code.namespace` so the span name (`namespace > function`) reads
-    // `[chromium] > tests/math.spec.ts > math > adds numbers` —
-    // Playwright's native display / `--test-list` shape.
-    expect(testSpan!.attributes['code.function']).toBe('adds numbers');
-    expect(testSpan!.attributes['code.namespace']).toBe('[chromium] > tests/math.spec.ts > math');
+    // function is decorated with [project] so the span name (namespace > function)
+    // is byte-identical to buildTestKey's output — the backend stores this as
+    // test_name and matches it against per-project quarantine / unhealthy lists.
+    expect(testSpan!.attributes['code.function']).toBe('adds numbers [chromium]');
+    expect(testSpan!.attributes['code.namespace']).toBe('tests/math.spec.ts > math');
     expect(testSpan!.attributes['code.lineno']).toBe(15);
     expect(testSpan!.attributes['code.filepath']).toBe('tests/math.spec.ts');
     expect(testSpan!.attributes['code.file.path']).toBe('/root/tests/math.spec.ts');
@@ -156,7 +155,7 @@ describe('onTestEnd — passing test', () => {
     const session = reporter.getSession()!;
     expect(session.testCases).toHaveLength(1);
     expect(session.testCases[0].status).toBe('passed');
-    expect(session.testCases[0].function).toBe('my test');
+    expect(session.testCases[0].function).toBe('my test [chromium]');
   });
 
   it('makes the test case span a child of the session span', async () => {
@@ -480,7 +479,7 @@ describe('MergifyReporter V2 — quarantine', () => {
         testRunId: 'abc123def456',
         createdAt: '2026-04-21T16:07:42Z',
         rootDir: '/root',
-        quarantinedTests: ['[chromium] > tests/x.spec.ts > my test'],
+        quarantinedTests: ['tests/x.spec.ts > my test [chromium]'],
       })
     );
     process.env.MERGIFY_TEST_RUN_ID = 'abc123def456';
@@ -542,7 +541,7 @@ describe('MergifyReporter V2 — quarantine', () => {
     expect(output).toContain('Quarantine report');
     expect(output).toContain('fetched: 1');
     expect(output).toContain('caught:  1');
-    expect(output).toContain('    - [chromium] > tests/x.spec.ts > my test');
+    expect(output).toContain('    - tests/x.spec.ts > my test [chromium]');
     expect(output).toContain('unused:  0');
   });
 
@@ -603,7 +602,7 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
       flakyContext: {
         budget_ratio_for_new_tests: 0.5,
         budget_ratio_for_unhealthy_tests: 0.5,
-        existing_test_names: ['[proj] > tests/sample.spec.ts > existing-test'],
+        existing_test_names: ['tests/sample.spec.ts > existing-test [proj]'],
         existing_tests_mean_duration_ms: 100,
         unhealthy_test_names: [],
         max_test_execution_count: 5,
@@ -636,8 +635,8 @@ describe('MergifyReporter — flaky-detection onBegin candidate computation', ()
 
     expect(new Set(reporter.getFlakyCandidates())).toEqual(
       new Set([
-        '[proj] > tests/sample.spec.ts > new-test-1',
-        '[proj] > tests/sample.spec.ts > new-test-2',
+        'tests/sample.spec.ts > new-test-1 [proj]',
+        'tests/sample.spec.ts > new-test-2 [proj]',
       ])
     );
   });
@@ -735,7 +734,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
         budget_ratio_for_unhealthy_tests: 0.5,
         existing_test_names: [],
         existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['[proj] > tests/sample.spec.ts > a'],
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
         max_test_execution_count: 5,
         max_test_name_length: 200,
         min_budget_duration_ms: 1_000,
@@ -765,70 +764,6 @@ describe('MergifyReporter — flaky-detection summary block', () => {
     expect(candidate.flakyDetection).toBeDefined();
   });
 
-  it('treats the buildTestKey `[project] >` prefix as SAFE — the brackets at the head of the assembled key are the wire-format project prefix, not a real bracket character in the test name', async () => {
-    // Regression guard: the safety filter must audit per-segment parts
-    // (filepath, describes, title) + the project as a sibling, NOT the
-    // assembled key — the key legitimately starts with `[project] >` and
-    // that bracket would always fail isTestListSafe by construction.
-    seedFlakyState({
-      flakyContext: {
-        budget_ratio_for_new_tests: 0.5,
-        budget_ratio_for_unhealthy_tests: 0.5,
-        existing_test_names: [],
-        existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['[proj] > tests/sample.spec.ts > a'],
-        max_test_execution_count: 5,
-        max_test_name_length: 200,
-        min_budget_duration_ms: 1_000,
-        min_test_execution_count: 3,
-      },
-    });
-    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const test = fakeTest({
-      title: 'a',
-      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
-      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
-    });
-    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
-    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
-    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
-    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
-
-    const out = log.mock.calls.map((c) => String(c[0])).join('');
-    expect(out).not.toContain('skipping');
-    expect(out).not.toContain('cannot disambiguate');
-  });
-
-  it('reports and skips a candidate whose project name contains an unsafe character', async () => {
-    seedFlakyState({
-      flakyContext: {
-        budget_ratio_for_new_tests: 0.5,
-        budget_ratio_for_unhealthy_tests: 0.5,
-        existing_test_names: [],
-        existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['[mobile > web] > tests/sample.spec.ts > a'],
-        max_test_execution_count: 5,
-        max_test_name_length: 200,
-        min_budget_duration_ms: 1_000,
-        min_test_execution_count: 3,
-      },
-    });
-    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const test = fakeTest({
-      title: 'a',
-      titlePath: ['', 'mobile > web', 'sample.spec.ts', 'a'],
-      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
-    });
-    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
-    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
-    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
-    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
-
-    const out = log.mock.calls.map((c) => String(c[0])).join('');
-    expect(out).toContain('skipping 1 flaky-detection candidate(s)');
-    expect(out).toContain('[mobile > web] > tests/sample.spec.ts > a');
-  });
-
   it('does not emit flakyDetection for a candidate that was skipped in phase 1 and not rerun', async () => {
     // Mark the test as an unhealthy candidate so FlakyDetector identifies
     // it from the suite during onBegin. The test then runs as skipped in
@@ -841,7 +776,7 @@ describe('MergifyReporter — flaky-detection summary block', () => {
         budget_ratio_for_unhealthy_tests: 0.5,
         existing_test_names: [],
         existing_tests_mean_duration_ms: 100,
-        unhealthy_test_names: ['[proj] > tests/sample.spec.ts > a'],
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
         max_test_execution_count: 5,
         max_test_name_length: 200,
         min_budget_duration_ms: 1_000,

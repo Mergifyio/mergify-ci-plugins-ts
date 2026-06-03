@@ -84,10 +84,10 @@ function runPlaywrightFixture(): ReturnType<typeof spawnSync> {
 
 describe('integration: quarantine end-to-end', () => {
   it('absorbs the quarantined failure but still fails on the non-quarantined one', () => {
-    // The fixture config defines `projects: [{ name: 'node' }]`, so every
-    // key emitted by `buildTestKey` is prefixed with `[node] >` — quarantine
+    // The fixture config defines `projects: [{ name: 'node' }]`, so every key
+    // emitted by `buildTestKey` carries the ` [node]` suffix — quarantine
     // seeds must match that shape exactly or the entry is "unused".
-    seedStateFile(['[node] > sample.spec.ts > quarantined-fails']);
+    seedStateFile(['sample.spec.ts > quarantined-fails [node]']);
     const result = runPlaywrightFixture();
 
     const combined = `${result.stdout}\n${result.stderr}`;
@@ -99,7 +99,7 @@ describe('integration: quarantine end-to-end', () => {
     expect(combined).toContain('Quarantine report');
     expect(combined).toContain('fetched: 1');
     expect(combined).toContain('caught:  1');
-    expect(combined).toContain('[node] > sample.spec.ts > quarantined-fails');
+    expect(combined).toContain('sample.spec.ts > quarantined-fails [node]');
     expect(combined).toContain('unused:  0');
 
     // 2 passed = `passes` + `quarantined-fails` (absorbed), 1 failed = `fails`.
@@ -108,7 +108,7 @@ describe('integration: quarantine end-to-end', () => {
   }, 60_000);
 
   it('reports every list entry as unused when nothing matches', () => {
-    seedStateFile(['[node] > sample.spec.ts > does-not-exist']);
+    seedStateFile(['sample.spec.ts > does-not-exist [node]']);
     const result = runPlaywrightFixture();
 
     const combined = `${result.stdout}\n${result.stderr}`;
@@ -118,15 +118,15 @@ describe('integration: quarantine end-to-end', () => {
     expect(result.status).toBe(1);
     expect(combined).toContain('caught:  0');
     expect(combined).toContain('unused:  1');
-    expect(combined).toContain('[node] > sample.spec.ts > does-not-exist');
+    expect(combined).toContain('sample.spec.ts > does-not-exist [node]');
   }, 60_000);
 
   it('does not absorb a quarantine entry whose project does not match', () => {
     // Same test, wrong project — the per-project key is the whole point of
-    // this design. A `[chromium] > …` entry must NOT absorb the `[node] > …`
-    // failure, so the test still counts as failed and the seed is listed
-    // under unused.
-    seedStateFile(['[chromium] > sample.spec.ts > quarantined-fails']);
+    // this design. `quarantined-fails [chromium]` must NOT absorb the
+    // `[node]` failure, so the test still counts as failed and the seed is
+    // listed under unused.
+    seedStateFile(['sample.spec.ts > quarantined-fails [chromium]']);
     const result = runPlaywrightFixture();
 
     const combined = `${result.stdout}\n${result.stderr}`;
@@ -229,7 +229,7 @@ describe('integration: flaky detection — unhealthy mode', () => {
     seedFlakyState({
       mode: 'unhealthy',
       rootDir: join(fixtureRoot, 'tests-unhealthy'),
-      unhealthyTestNames: ['[node] > sample.spec.ts > flaky-test'],
+      unhealthyTestNames: ['sample.spec.ts > flaky-test [node]'],
     });
 
     const result = runFlakyFixture({
@@ -243,7 +243,7 @@ describe('integration: flaky detection — unhealthy mode', () => {
     expect(combined).toContain('mode: unhealthy');
     expect(combined).toContain('Tests rerun: 1');
     expect(combined).toContain('Flaky tests detected: 1');
-    expect(combined).toContain('[node] > sample.spec.ts > flaky-test');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node]');
   }, 90_000);
 });
 
@@ -253,7 +253,7 @@ describe('integration: flaky detection — new mode', () => {
     seedFlakyState({
       mode: 'new',
       rootDir: join(fixtureRoot, 'tests-unhealthy'),
-      existingTestNames: ['[node] > sample.spec.ts > passes'],
+      existingTestNames: ['sample.spec.ts > passes [node]'],
     });
 
     const result = runFlakyFixture({
@@ -267,7 +267,7 @@ describe('integration: flaky detection — new mode', () => {
     expect(combined).toContain('Flaky detection report');
     expect(combined).toContain('mode: new');
     expect(combined).toContain('Flaky tests detected: 1');
-    expect(combined).toContain('[node] > sample.spec.ts > flaky-test');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node]');
   }, 90_000);
 });
 
@@ -287,8 +287,8 @@ describe('integration: flaky detection — multi-project', () => {
       mode: 'unhealthy',
       rootDir: join(fixtureRoot, 'tests-unhealthy'),
       unhealthyTestNames: [
-        '[node-a] > sample.spec.ts > flaky-test',
-        '[node-b] > sample.spec.ts > flaky-test',
+        'sample.spec.ts > flaky-test [node-a]',
+        'sample.spec.ts > flaky-test [node-b]',
       ],
     });
 
@@ -306,7 +306,7 @@ describe('integration: flaky detection — multi-project', () => {
     expect(combined).toContain('mode: unhealthy');
     expect(combined).toContain('Tests rerun: 2');
     expect(combined).toContain('Flaky tests detected: 2');
-    expect(combined).toContain('[node-a] > sample.spec.ts > flaky-test');
-    expect(combined).toContain('[node-b] > sample.spec.ts > flaky-test');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node-a]');
+    expect(combined).toContain('sample.spec.ts > flaky-test [node-b]');
   }, 120_000);
 });
