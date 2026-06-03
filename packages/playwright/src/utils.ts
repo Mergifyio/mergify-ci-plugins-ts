@@ -58,6 +58,24 @@ export function buildTestFunction(title: string, project: string | undefined): s
 }
 
 /**
+ * Shared inner of `buildTestKey` and `buildTestKeyFromInfo`. Strips the file
+ * suite from the raw describes, decorates the title with `[project]`, and
+ * joins with ` > ` (dropping empty segments so the namespace-empty case still
+ * produces a clean key).
+ */
+function assembleKey(
+  filepath: string,
+  rawDescribes: readonly string[],
+  project: string | undefined,
+  title: string
+): string {
+  const describes = stripFileSuite(rawDescribes, filepath);
+  const decoratedTitle = buildTestFunction(title, project);
+  const parts = [filepath, ...describes, decoratedTitle].filter((p) => p.length > 0);
+  return parts.join(' > ');
+}
+
+/**
  * Build the matching key for a Playwright test: the same string the Mergify
  * backend stores as `test_name` (derived from the emitted span name). Used
  * both for quarantine list matching and for flaky-detection candidate
@@ -73,20 +91,35 @@ export function buildTestFunction(title: string, project: string | undefined): s
  *   namespace > function  (when namespace is non-empty)
  *   function              (when namespace is empty)
  * where `namespace` is `extractNamespace(filepath, titlePath)` and the function
- * is decorated with `[project]` via `buildTestFunction`. The filter step below
- * drops the empty prefix in the namespace-empty case so the equality holds in
- * both.
+ * is decorated with `[project]` via `buildTestFunction`.
  */
 export function buildTestKey(
   filepath: string,
   titlePath: readonly string[],
   title: string
 ): string {
-  const project = titlePath[1] ?? '';
+  return assembleKey(filepath, titlePath.slice(2, -1), titlePath[1] ?? '', title);
+}
+
+/**
+ * Return the individual segments (filepath, ...describes, title) that
+ * `buildTestKey` assembles into the key, AFTER the file-suite dedup but
+ * BEFORE project decoration and empty-filtering. Each segment must
+ * independently satisfy `isTestListSafe` for the candidate to survive
+ * phase-2 `--test-list` round-tripping.
+ *
+ * The segments are returned WITHOUT empty filtering — `extractNamespace`
+ * and `buildTestKey` drop empties so a missing filepath doesn't break the
+ * key, but for safety auditing we want the caller to see exactly what
+ * Playwright would parse.
+ */
+export function buildTestKeyParts(
+  filepath: string,
+  titlePath: readonly string[],
+  title: string
+): readonly string[] {
   const describes = stripFileSuite(titlePath.slice(2, -1), filepath);
-  const decoratedTitle = buildTestFunction(title, project);
-  const parts = [filepath, ...describes, decoratedTitle].filter((p) => p.length > 0);
-  return parts.join(' > ');
+  return [filepath, ...describes, title];
 }
 
 /**
@@ -104,13 +137,34 @@ export function buildTestKey(
 export function buildTestKeyFromInfo(
   filepath: string,
   infoTitlePath: readonly string[],
-  project: string | undefined,
+  project: string,
   title: string
 ): string {
-  const describes = stripFileSuite(infoTitlePath.slice(1, -1), filepath);
-  const decoratedTitle = buildTestFunction(title, project);
-  const parts = [filepath, ...describes, decoratedTitle].filter((p) => p.length > 0);
-  return parts.join(' > ');
+  return assembleKey(filepath, infoTitlePath.slice(1, -1), project, title);
+}
+
+/**
+ * Characters that Playwright's `loadTestList` cannot disambiguate in a
+ * single line:
+ *  - `>`  and `›` are both accepted as the segment separator; mixing them
+ *    inside one line confuses the single-delimiter split.
+ *  - `[` / `]` collide with the optional `[project]` prefix parser.
+ *  - `\n` splits a single test description into two malformed lines.
+ *
+ * Any candidate carrying one of these in its project name, file path,
+ * describe segments, or title cannot be safely scoped via `--test-list`.
+ */
+const TEST_LIST_UNSAFE = /[[\]>\n]|›/u;
+
+/**
+ * Return true when the string can flow through Playwright's `--test-list`
+ * loader (`loadTestList` in `playwright/lib/runner/index.js`) without
+ * mis-parsing. Used to filter phase-2 candidates so a single unrepresentable
+ * test name (or project name, or file path containing `[`) can't crash the
+ * whole subprocess.
+ */
+export function isTestListSafe(s: string): boolean {
+  return !TEST_LIST_UNSAFE.test(s);
 }
 
 /**
@@ -121,25 +175,28 @@ export function buildTestKeyFromInfo(
  * (see `loadTestList` in `playwright/lib/runner/index.js`), and matches the
  * remaining `file > describes > title` against `test.titlePath()`. Because we
  * append `[project]` to the END of the key (so it appears in span names and
- * the backend's test_name), we have to strip that trailing suffix before
- * writing the test-list line — otherwise Playwright would try to match a
- * test whose title literally ends with `[project]` and find nothing.
+ * the backend's test_name), we strip the suffix before writing the line.
  *
- * The whole line uses ` > ` as the separator. Playwright accepts `>` and `›`
- * interchangeably but picks ONE per line (whichever is found) and splits the
- * entire line on it; mixing `›` between the project bracket and `>` inside
- * the bareKey makes the loader split on `›` and treat the bareKey body as a
- * single un-split token, so the test never matches.
- *
- * The suffix strip is exact (`endsWith(' [project]')`), not a regex parse, so
- * a title that legitimately ends in `[something]` is unaffected as long as
- * `something` is not the current project name.
+ * The whole line uses ` > ` as the separator throughout. Playwright accepts
+ * `>` and `›` interchangeably but picks ONE per line (the first that appears)
+ * and splits the entire line on it; mixing the two — `[project] › body > with
+ * > separators` — makes the loader split on `›`, treat the body as one token,
+ * and fail to match. Callers must pre-filter inputs that contain `>` / `›` /
+ * `[` / `]` / `\n` via `isTestListSafe` — this function does no escaping.
  */
 export function formatTestListLine(key: string, project: string | undefined): string {
   if (!project || project.length === 0) return key;
   const suffix = ` [${project}]`;
-  const bareKey = key.endsWith(suffix) ? key.slice(0, -suffix.length) : key;
-  return `[${project}] > ${bareKey}`;
+  // Callers always pair a key with the project that built it, so the suffix
+  // is present by construction. If a future caller breaks that invariant we
+  // want to know rather than silently produce a line Playwright would parse
+  // as a different test.
+  if (!key.endsWith(suffix)) {
+    throw new Error(
+      `formatTestListLine: key ${JSON.stringify(key)} does not end with project suffix ${JSON.stringify(suffix)}`
+    );
+  }
+  return `[${project}] > ${key.slice(0, -suffix.length)}`;
 }
 
 /**

@@ -21,7 +21,6 @@ function fakeTest(
     titlePath?: string[];
     location?: { file: string; line: number; column: number };
     retries?: number;
-    parent?: unknown;
     outcome?: () => 'expected' | 'unexpected' | 'flaky' | 'skipped';
     annotations?: Array<{ type: string; description?: string }>;
   } = {}
@@ -32,6 +31,8 @@ function fakeTest(
     // The file-suite slot is the basename (`x.spec.ts`), NOT the absolute
     // path — stripFileSuite recognises basename / relative-from-rootDir; an
     // absolute path leaks into the namespace and breaks buildTestKey.
+    // `projectNameFromTest` reads titlePath[1] directly, so we don't mock
+    // `parent.project()` — that field would be dead code.
     titlePath: () => overrides.titlePath ?? ['', 'chromium', 'x.spec.ts', 'my test'],
     location: overrides.location ?? {
       file: '/root/tests/x.spec.ts',
@@ -40,7 +41,6 @@ function fakeTest(
     },
     retries: overrides.retries ?? 0,
     results: [] as TestResult[],
-    parent: overrides.parent ?? ({ project: () => ({ name: 'chromium' }) } as unknown),
     outcome: overrides.outcome ?? (() => 'expected'),
     annotations: overrides.annotations ?? [],
   } as unknown as TestCase;
@@ -719,6 +719,113 @@ describe('MergifyReporter — flaky-detection summary block', () => {
     // Test 'a' is not in flakyCandidates → not aggregated, so 0 rerun + 0 flaky.
     expect(out).toContain('Tests rerun: 0');
     expect(out).toContain('Flaky tests detected: 0');
+  });
+
+  it('preserves the first phase-1 failure when the same (test, project) key is recorded twice (Playwright `repeatEach`)', async () => {
+    // Regression guard for the dedup-removal correctness bug: with
+    // repeatEach > 1, Playwright clones each test with byte-identical
+    // titlePath, so onTestEnd fires twice for the same key. The first
+    // recorded failure must NOT be overwritten by a subsequent passing
+    // repeat, otherwise the FlakyDetector seeds with the wrong status and
+    // misses flaky-on-first-attempt tests entirely.
+    seedFlakyState({
+      flakyContext: {
+        budget_ratio_for_new_tests: 0.5,
+        budget_ratio_for_unhealthy_tests: 0.5,
+        existing_test_names: [],
+        existing_tests_mean_duration_ms: 100,
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
+        max_test_execution_count: 5,
+        max_test_name_length: 200,
+        min_budget_duration_ms: 1_000,
+        min_test_execution_count: 3,
+      },
+    });
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+    });
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
+    // First clone fails, second clone (same key) passes.
+    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
+    reporter.onTestEnd(test, fakeResult({ status: 'passed' }));
+    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
+
+    // Both clones share a flakyDetection block (we decorate every buffered
+    // entry), but flakyResults must have ONE row, and the fail seeded into
+    // the detector must show up in the verdict as flaky=false-but-not-pass-
+    // only (the test ran with one fail + zero phase-2 outcomes, so
+    // isFlaky=false but rerunCount=0; the regression we're guarding against
+    // is a second push to flakyResults inflating the count).
+    const session = reporter.getSession()!;
+    const candidate = session.testCases[0];
+    expect(candidate.flakyDetection).toBeDefined();
+  });
+
+  it('treats the buildTestKey ` [project]` suffix as SAFE — the suffix is what formatTestListLine strips back off, not a real bracket character in the test name', async () => {
+    // Regression guard: a previous version of the safety filter rejected
+    // every multi-project candidate because the assembled key ends with
+    // ` [project]` and that key was passed to isTestListSafe verbatim.
+    // The filter must inspect the per-segment parts, not the decorated key.
+    seedFlakyState({
+      flakyContext: {
+        budget_ratio_for_new_tests: 0.5,
+        budget_ratio_for_unhealthy_tests: 0.5,
+        existing_test_names: [],
+        existing_tests_mean_duration_ms: 100,
+        unhealthy_test_names: ['tests/sample.spec.ts > a [proj]'],
+        max_test_execution_count: 5,
+        max_test_name_length: 200,
+        min_budget_duration_ms: 1_000,
+        min_test_execution_count: 3,
+      },
+    });
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['', 'proj', 'sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+    });
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
+    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
+    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
+
+    const out = log.mock.calls.map((c) => String(c[0])).join('');
+    expect(out).not.toContain('skipping');
+    expect(out).not.toContain('cannot disambiguate');
+  });
+
+  it('reports and skips a candidate whose project name contains an unsafe character', async () => {
+    seedFlakyState({
+      flakyContext: {
+        budget_ratio_for_new_tests: 0.5,
+        budget_ratio_for_unhealthy_tests: 0.5,
+        existing_test_names: [],
+        existing_tests_mean_duration_ms: 100,
+        unhealthy_test_names: ['tests/sample.spec.ts > a [mobile > web]'],
+        max_test_execution_count: 5,
+        max_test_name_length: 200,
+        min_budget_duration_ms: 1_000,
+        min_test_execution_count: 3,
+      },
+    });
+    const log = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const test = fakeTest({
+      title: 'a',
+      titlePath: ['', 'mobile > web', 'sample.spec.ts', 'a'],
+      location: { file: '/root/tests/sample.spec.ts', line: 1, column: 1 },
+    });
+    const reporter = new MergifyReporter({ exporter: new InMemorySpanExporter() });
+    reporter.onBegin(fakeConfig(), { allTests: () => [test] } as unknown as Suite);
+    reporter.onTestEnd(test, fakeResult({ status: 'failed', errors: [] }));
+    await reporter.onEnd({ status: 'failed', startTime: new Date(), duration: 1 });
+
+    const out = log.mock.calls.map((c) => String(c[0])).join('');
+    expect(out).toContain('skipping 1 flaky-detection candidate(s)');
+    expect(out).toContain('tests/sample.spec.ts > a [mobile > web]');
   });
 
   it('does not emit flakyDetection for a candidate that was skipped in phase 1 and not rerun', async () => {

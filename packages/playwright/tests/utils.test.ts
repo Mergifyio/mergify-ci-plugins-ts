@@ -3,8 +3,10 @@ import {
   buildTestFunction,
   buildTestKey,
   buildTestKeyFromInfo,
+  buildTestKeyParts,
   extractNamespace,
   formatTestListLine,
+  isTestListSafe,
   mapStatus,
   projectNameFromTest,
   toPosix,
@@ -219,9 +221,9 @@ describe('buildTestKeyFromInfo', () => {
     ).toBe('sample.spec.ts > quarantined-fails [node]');
   });
 
-  it('omits [project] when project is undefined (unnamed default project)', () => {
+  it('omits [project] when project is the empty string (unnamed default project)', () => {
     expect(
-      buildTestKeyFromInfo('sample.spec.ts', ['sample.spec.ts', 'my test'], undefined, 'my test')
+      buildTestKeyFromInfo('sample.spec.ts', ['sample.spec.ts', 'my test'], '', 'my test')
     ).toBe('sample.spec.ts > my test');
   });
 });
@@ -245,14 +247,61 @@ describe('formatTestListLine', () => {
     );
   });
 
-  it('emits a usable line even when the key does not end with the expected suffix', () => {
-    // Defensive: if the caller passes a project that doesn't match the key
-    // suffix, we still produce a valid `[project] > ...` line — Playwright
-    // matches by project + title-path-prefix, and the body still describes a
-    // real test. Better to fan-out one extra project than to silently swallow
-    // the candidate.
-    expect(formatTestListLine('tests/x.spec.ts > my test', 'firefox')).toBe(
-      '[firefox] > tests/x.spec.ts > my test'
+  it('throws when the key does not end with the expected `[project]` suffix', () => {
+    // The defensive fallback the previous version had silently produced a
+    // valid-looking line that pointed at a different test. A mismatched
+    // (key, project) pair is a caller bug; surface it loudly instead of
+    // emitting a line that Playwright will dutifully run against the wrong
+    // candidate.
+    expect(() => formatTestListLine('tests/x.spec.ts > my test', 'firefox')).toThrowError(
+      /does not end with project suffix/
     );
+  });
+});
+
+describe('buildTestKeyParts', () => {
+  // The parts function returns the unfiltered segments so the safety check
+  // can audit each one individually before phase 2 writes it to a
+  // --test-list line. The full assembled `buildTestKey` always ends in
+  // ` [project]`, which carries `[` / `]` and would fail isTestListSafe by
+  // construction — that's why we audit segments, not the key.
+  it('returns [filepath, ...describes, title] after stripFileSuite', () => {
+    expect(
+      buildTestKeyParts(
+        'tests/sample.spec.ts',
+        ['', 'node', 'sample.spec.ts', 'Outer', 'flaky-test'],
+        'flaky-test'
+      )
+    ).toEqual(['tests/sample.spec.ts', 'Outer', 'flaky-test']);
+  });
+
+  it('handles flat tests (no describes)', () => {
+    expect(
+      buildTestKeyParts(
+        'sample.spec.ts',
+        ['', 'node', 'sample.spec.ts', 'quarantined-fails'],
+        'quarantined-fails'
+      )
+    ).toEqual(['sample.spec.ts', 'quarantined-fails']);
+  });
+});
+
+describe('isTestListSafe', () => {
+  // Playwright's `loadTestList` (lib/runner/index.js:2578-2584) splits each
+  // line on `>` (or `›`, whichever appears first) and then requires a
+  // leading `[…]` bracket to close on the SAME token. A `>` / `[` / `]` /
+  // `›` / newline inside a project name, file path, describe, or title
+  // therefore throws "Malformed test description" and aborts the entire
+  // phase-2 subprocess. `runFlakyDetectionPhase2` pre-filters via this
+  // predicate so one unrepresentable name can't collapse every verdict.
+  it.each([
+    ['bare ascii', true],
+    ['mobile > web', false],
+    ['chrome [test]', false],
+    ['tests/[id].spec.ts', false],
+    ['line\nbreak', false],
+    ['unicode ›', false],
+  ] as const)('isTestListSafe(%j) → %s', (input, expected) => {
+    expect(isTestListSafe(input)).toBe(expected);
   });
 });
