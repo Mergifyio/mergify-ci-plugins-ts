@@ -1,6 +1,10 @@
 {
   "name": "@mergifyio/vitest",
   "version": "0.0.0",
+  "homepage": "https://github.com/Mergifyio/mergify-ci-plugins-ts",
+  "bugs": {
+    "url": "https://github.com/Mergifyio/mergify-ci-plugins-ts/issues"
+  },
   "description": "Vitest reporter for Mergify CI Insights",
   "license": "GPL-3.0-only",
   "type": "module",
