@@ -44,5 +44,9 @@
     "url": "git+https://github.com/Mergifyio/mergify-ci-plugins-ts.git",
     "directory": "packages/core"
   },
+  "bugs": {
+    "url": "https://github.com/Mergifyio/mergify-ci-plugins-ts/issues"
+  },
+  "homepage": "https://github.com/Mergifyio/mergify-ci-plugins-ts/tree/main/packages/core#readme",
   "author": "Mergify <hello@mergify.com>"
 }
