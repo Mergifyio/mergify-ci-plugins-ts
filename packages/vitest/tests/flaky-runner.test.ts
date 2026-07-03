@@ -1,4 +1,6 @@
-import { resolve } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { FlakyDetectionContext } from '@mergifyio/ci-core';
 import { InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -85,5 +87,46 @@ describe('Flaky detection runner', () => {
     expect(testSpan).toBeDefined();
     // No flaky detection attributes since test is existing
     expect(testSpan!.attributes['cicd.test.flaky_detection']).toBeUndefined();
+  });
+
+  it('skips flaky detection on draft pull requests', async () => {
+    // Drive the env-gated path (token + repo + mode set) so the only reason
+    // detection is skipped is the draft guard, then assert the
+    // flaky-detection-context endpoint is never fetched.
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ quarantined_tests: [] }), { status: 200 })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubEnv('MERGIFY_TOKEN', 'test-token');
+    vi.stubEnv('_MERGIFY_TEST_NEW_FLAKY_DETECTION', 'new');
+
+    const eventDir = mkdtempSync(join(tmpdir(), 'mergify-event-'));
+    writeFileSync(join(eventDir, 'event.json'), JSON.stringify({ pull_request: { draft: true } }));
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', join(eventDir, 'event.json'));
+
+    const exporter = new InMemorySpanExporter();
+    const reporter = new MergifyReporter({ exporter });
+
+    const vitest = await startVitest('test', [], {
+      root: fixturesDir,
+      include: ['passing.test.ts'],
+      reporters: [reporter],
+      watch: false,
+    });
+    await vitest?.close();
+
+    // The draft guard short-circuits before the flaky-detection-context fetch.
+    const fetchedFlakyContext = fetchMock.mock.calls.some((call) =>
+      String(call[0]).includes('flaky-detection-context')
+    );
+    expect(fetchedFlakyContext).toBe(false);
+    const spans = exporter.getFinishedSpans();
+    const testSpan = spans.find((s) => s.attributes['test.scope'] === 'case');
+    expect(testSpan).toBeDefined();
+    expect(testSpan!.attributes['cicd.test.flaky_detection']).toBeUndefined();
+
+    rmSync(eventDir, { recursive: true, force: true });
   });
 });

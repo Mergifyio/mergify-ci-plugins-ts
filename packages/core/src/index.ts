@@ -34,6 +34,7 @@ export {
   getRepoName,
   getRepositoryNameFromUrl,
   git,
+  isDraftPullRequest,
   isInCI,
   resolveBranchFromAttributes,
   splitRepoName,

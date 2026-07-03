@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { Attributes } from '@opentelemetry/api';
 
 export type CIProvider = 'github_actions' | 'jenkins' | 'circleci' | 'buildkite';
@@ -34,6 +35,32 @@ export function envToBool(value: string | undefined, fallback: boolean): boolean
 /** Check if running in a CI environment. */
 export function isInCI(): boolean {
   return envToBool(process.env.CI, !!(process.env.CI ?? '').length);
+}
+
+/**
+ * Returns `true` when the current GitHub Actions run targets a draft pull
+ * request (e.g. a Mergify merge-queue batch pull request), `false` otherwise.
+ *
+ * Draft pull requests run CI but must not spend extra CI budget on
+ * flaky-detection reruns.
+ */
+export function isDraftPullRequest(): boolean {
+  const eventName = process.env.GITHUB_EVENT_NAME;
+  if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
+    return false;
+  }
+
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) return false;
+
+  try {
+    const event = JSON.parse(readFileSync(eventPath, 'utf-8'));
+    return event?.pull_request?.draft === true;
+  } catch {
+    // A malformed or unreadable event payload must not crash the run;
+    // keep flaky detection enabled in that case.
+    return false;
+  }
 }
 
 /** Detect the current CI provider from environment variables. */

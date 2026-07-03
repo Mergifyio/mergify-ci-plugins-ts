@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { resolveBranchFromAttributes, strtobool } from '../src/utils.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isDraftPullRequest, resolveBranchFromAttributes, strtobool } from '../src/utils.js';
 
 describe('strtobool', () => {
   it.each([
@@ -77,5 +80,74 @@ describe('resolveBranchFromAttributes', () => {
         'vcs.ref.head.name': '',
       })
     ).toBeUndefined();
+  });
+});
+
+describe('isDraftPullRequest', () => {
+  let eventDir: string | undefined;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    if (eventDir) {
+      rmSync(eventDir, { recursive: true, force: true });
+      eventDir = undefined;
+    }
+  });
+
+  function writeEvent(payload: unknown): string {
+    eventDir = mkdtempSync(join(tmpdir(), 'mergify-event-'));
+    const eventPath = join(eventDir, 'event.json');
+    writeFileSync(eventPath, JSON.stringify(payload));
+    return eventPath;
+  }
+
+  it('returns true for a draft pull request', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', writeEvent({ pull_request: { draft: true } }));
+    expect(isDraftPullRequest()).toBe(true);
+  });
+
+  it('returns true for a draft pull_request_target event', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request_target');
+    vi.stubEnv('GITHUB_EVENT_PATH', writeEvent({ pull_request: { draft: true } }));
+    expect(isDraftPullRequest()).toBe(true);
+  });
+
+  it('returns false for a non-draft pull request', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', writeEvent({ pull_request: { draft: false } }));
+    expect(isDraftPullRequest()).toBe(false);
+  });
+
+  it('returns false when the event is not a pull request', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'push');
+    expect(isDraftPullRequest()).toBe(false);
+  });
+
+  it('returns false when GITHUB_EVENT_PATH is unset', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', '');
+    expect(isDraftPullRequest()).toBe(false);
+  });
+
+  it('returns false when the event file is missing', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', join(tmpdir(), 'mergify-missing-event.json'));
+    expect(isDraftPullRequest()).toBe(false);
+  });
+
+  it('returns false when the event payload is malformed', () => {
+    eventDir = mkdtempSync(join(tmpdir(), 'mergify-event-'));
+    const eventPath = join(eventDir, 'event.json');
+    writeFileSync(eventPath, '{ not valid json');
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', eventPath);
+    expect(isDraftPullRequest()).toBe(false);
+  });
+
+  it('returns false when the payload has an unexpected shape', () => {
+    vi.stubEnv('GITHUB_EVENT_NAME', 'pull_request');
+    vi.stubEnv('GITHUB_EVENT_PATH', writeEvent(['not', 'an', 'object']));
+    expect(isDraftPullRequest()).toBe(false);
   });
 });

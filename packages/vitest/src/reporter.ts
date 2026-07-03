@@ -16,6 +16,7 @@ import {
   fetchQuarantineList,
   generateTestRunId,
   getRepoName,
+  isDraftPullRequest,
   isInCI,
   resolveBranchFromAttributes,
   startSessionSpan,
@@ -111,7 +112,10 @@ export class MergifyReporter implements Reporter {
       const flakyModeEnv = process.env._MERGIFY_TEST_NEW_FLAKY_DETECTION;
       if (flakyModeEnv === 'new' || flakyModeEnv === 'unhealthy') {
         this.flakyMode = flakyModeEnv;
-        if (token && repoName) {
+        // Draft pull requests (e.g. Mergify merge-queue batch PRs) run CI but
+        // must not spend extra CI budget on reruns, so skip flaky detection on
+        // them. Non-draft PRs and push/scheduled runs are unaffected.
+        if (token && repoName && !isDraftPullRequest()) {
           this._initFlakyDetection(vitest, { apiUrl, token, repoName });
         }
       }
