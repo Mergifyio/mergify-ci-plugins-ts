@@ -1,5 +1,13 @@
 # @mergifyio/playwright
 
+> **Actively maintained — the source moved.** `@mergifyio/playwright` is still
+> developed and published to npm, now from the
+> [Mergifyio/mergify-ci-integrations](https://github.com/Mergifyio/mergify-ci-integrations)
+> monorepo (see
+> [`clients/ts/`](https://github.com/Mergifyio/mergify-ci-integrations/tree/main/clients/ts)).
+> Installation and usage below are unchanged — please open issues and pull
+> requests on the monorepo.
+
 A **Playwright** reporter that integrates seamlessly with **Mergify**, uploading
 OpenTelemetry traces of test executions to Mergify CI Insights and absorbing
 failures of tests quarantined via Mergify's CI Insights Quarantine feature.

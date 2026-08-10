@@ -1,5 +1,12 @@
 # @mergifyio/ci-core
 
+> **Actively maintained — the source moved.** `@mergifyio/ci-core` is still
+> developed and published to npm, now from the
+> [Mergifyio/mergify-ci-integrations](https://github.com/Mergifyio/mergify-ci-integrations)
+> monorepo (see
+> [`clients/ts/`](https://github.com/Mergifyio/mergify-ci-integrations/tree/main/clients/ts)).
+> Please open issues and pull requests on the monorepo.
+
 Internal shared core for Mergify's test-framework reporters.
 
 This package is not intended for direct consumption. It is consumed by the

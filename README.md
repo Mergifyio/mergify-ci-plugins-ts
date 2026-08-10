@@ -1,5 +1,16 @@
 # Mergify CI plugins (pnpm monorepo)
 
+> **This repository is no longer the development home.** Development continues in
+> [Mergifyio/mergify-ci-integrations](https://github.com/Mergifyio/mergify-ci-integrations),
+> under [`clients/ts/`](https://github.com/Mergifyio/mergify-ci-integrations/tree/main/clients/ts).
+>
+> **The npm packages are unaffected and still maintained.** `@mergifyio/vitest`,
+> `@mergifyio/playwright` and `@mergifyio/ci-core` are still published from the
+> monorepo, and installation instructions are unchanged.
+>
+> Please open issues and pull requests on
+> [Mergifyio/mergify-ci-integrations](https://github.com/Mergifyio/mergify-ci-integrations).
+
 Test-framework plugins that integrate with **Mergify CI Insights** — OpenTelemetry
 trace upload for every test run.
 
