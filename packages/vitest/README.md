@@ -1,5 +1,13 @@
 # @mergifyio/vitest
 
+> **Actively maintained — the source moved.** `@mergifyio/vitest` is still
+> developed and published to npm, now from the
+> [Mergifyio/mergify-ci-integrations](https://github.com/Mergifyio/mergify-ci-integrations)
+> monorepo (see
+> [`clients/ts/`](https://github.com/Mergifyio/mergify-ci-integrations/tree/main/clients/ts)).
+> Installation and usage below are unchanged — please open issues and pull
+> requests on the monorepo.
+
 A **Vitest** reporter that integrates seamlessly with **Mergify**, uploading
 OpenTelemetry traces of test executions to Mergify CI Insights, along with
 optional **quarantine** and **flaky-test detection**.
