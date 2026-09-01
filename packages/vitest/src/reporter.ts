@@ -1,4 +1,4 @@
-import { dirname, resolve } from 'node:path';
+import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
   FlakyDetectionContext,
@@ -157,10 +157,15 @@ export class MergifyReporter implements Reporter {
     // Provide quarantine list to workers via ProvidedContext
     vitest.provide('mergify:quarantine', [...this.quarantineList]);
 
-    // Auto-configure the custom runner if not already set
-    const dir =
-      typeof __dirname !== 'undefined' ? __dirname : dirname(fileURLToPath(import.meta.url));
-    const mergifyRunner = resolve(dir, 'runner.js');
+    // Auto-configure the custom runner if not already set.
+    // Resolve the runner sibling with the same extension as the current module: the build emits
+    // dist/index.cjs + dist/runner.cjs and dist/index.mjs + dist/runner.mjs (never runner.js), and
+    // in dev the sibling is src/runner.ts. A hardcoded 'runner.js' only worked in dev, where
+    // vite-node remaps the .js specifier onto runner.ts — in the published package the path goes
+    // through native node resolution and ERR_MODULE_NOT_FOUND aborts every test file (#169).
+    const moduleFile =
+      typeof __filename !== 'undefined' ? __filename : fileURLToPath(import.meta.url);
+    const mergifyRunner = resolve(dirname(moduleFile), `runner${extname(moduleFile)}`);
     if (!vitest.config.runner) {
       vitest.config.runner = mergifyRunner;
     } else if (vitest.config.runner !== mergifyRunner) {
